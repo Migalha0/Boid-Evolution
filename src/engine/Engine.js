@@ -5,12 +5,11 @@ import { ScumField } from '../gpu/ScumField.js'
 import { SiltField } from '../gpu/SiltField.js'
 import { SwayField } from '../gpu/SwayField.js'
 import { InfluenceField } from '../sim/InfluenceField.js'
-import { Dragonflies } from '../sim/Dragonflies.js'
-import { Insects } from '../sim/Insects.js'
 import { PLANT_KINDS, plantAmountKey } from '../sim/Vegetation.js'
 import { LilyPads } from '../sim/LilyPads.js'
 import { PondMap } from '../sim/PondMap.js'
 import { BoidRenderer } from '../render/BoidRenderer.js'
+import { InsectWorld } from './InsectWorld.js'
 
 /** The map extends this far beyond each screen edge, so its shore sits off-screen. */
 const WORLD_MARGIN = 48
@@ -39,9 +38,9 @@ export class Engine {
     this.map.landClearing = this.params.logLandClearing
     this.map.kindAmounts = PLANT_KINDS.map((k) => this.params[plantAmountKey(k.name)] ?? 1)
     this.pads = new LilyPads(this.map)
-    this.insects = new Insects(this.map, this.pads)
-    // Their predators: a species of their own that hunts them.
-    this.dragonflies = new Dragonflies(this.insects)
+    // The midges and their predators, the dragonflies, run in a worker.
+    this.insects = new InsectWorld(this.map, this.pads)
+    this.insects.setParams(this.params)
     this.time = 0
     this.history = [] // [time, fish, midges, dragonflies]
     this.historyClock = 0
@@ -129,6 +128,7 @@ export class Engine {
   setParams(next) {
     // Mutate in place: the simulation holds a reference to this object.
     Object.assign(this.params, next)
+    this.insects.setParams(this.params)
     const { map } = this
     const amounts = PLANT_KINDS.map((k) => this.params[plantAmountKey(k.name)] ?? 1)
     if (
@@ -165,32 +165,32 @@ export class Engine {
 
   /** Start the midges over: a fresh flock of random genomes, or from a profile. */
   restartMidges(profile = null) {
-    this.insects.seed(this.params, profile ?? (this.params.midgeLocked ? this.params.midgeProfile : null))
+    this.insects.restartMidges(profile)
   }
 
   /** Start the dragonflies over: newcomers with random genomes, or from a profile. */
   restartDragonflies(profile = null) {
-    this.dragonflies.restart(this.params, profile)
+    this.insects.restartDragonflies(profile)
   }
 
   /** Every living dragonfly takes the profile's genome. */
   applyDragonflyProfile(profile) {
-    this.dragonflies.applyProfile(profile)
+    this.insects.applyDragonflyProfile(profile)
   }
 
-  /** The living dragonflies' mean genome ({ count, generation, genes, spread }), or null. */
+  /** The living dragonflies' mean genome ({ count, generation, genes, spread }), or null (as last reported). */
   dragonflyPopulation() {
-    return this.dragonflies.population()
+    return this.insects.stats.dragonflies?.population ?? null
   }
 
   /** Every living midge takes the profile's genome. */
   applyMidgeProfile(profile) {
-    this.insects.applyProfile(profile)
+    this.insects.applyMidgeProfile(profile)
   }
 
-  /** The living midges' mean genome and where it comes from ({ count, generation, genes, spread }), or null. */
+  /** The living midges' mean genome and where it comes from ({ count, generation, genes, spread }), or null (as last reported). */
   midgePopulation() {
-    return this.insects.population()
+    return this.insects.stats.midges?.population ?? null
   }
 
   /** Lay the trunks somewhere else (same map). */
@@ -208,11 +208,8 @@ export class Engine {
     const n = sim.count
     x += WORLD_MARGIN
     y += WORLD_MARGIN
-    const insectsShown = this.params.showInsects
-    const dragonfly = insectsShown && this.params.showDragonflies && this.dragonflies.select(x, y)
-    const midge = !dragonfly && insectsShown && this.insects.select(x, y)
-    if (dragonfly) this.insects.select(-1e9, -1e9)
-    if (dragonfly || midge) {
+    const insect = this.params.showInsects && this.insects.pick(x, y, this.params.showDragonflies)
+    if (insect) {
       this.selected = -1
       this.selectedInfo = null
       callback?.(-1)
@@ -235,8 +232,7 @@ export class Engine {
       this.selectedInfo = null
       if (best >= 0) {
         // Deselect the midge and dragonfly.
-        this.insects.select(-1e9, -1e9)
-        this.dragonflies.select(-1e9, -1e9)
+        this.insects.deselect()
       }
       callback?.(best)
     })
@@ -259,6 +255,7 @@ export class Engine {
       }
       this.mapTex.sync()
       this.pads.sync()
+      this.insects.syncWorld()
       if (this.renderer.scumVersion !== this.insectScumVersion) {
         this.insects.setScum(this.renderer.scumSpots)
         this.insectScumVersion = this.renderer.scumVersion
@@ -273,15 +270,12 @@ export class Engine {
         this.sway.update(this.sim, dt, this.params)
         this.scum.update(this.sway, this.mapTex, dt, this.params)
         this.silt.update(this.sim, this.sway, this.mapTex, dt, this.params)
-        if (this.params.showInsects) {
-          const hunted = this.params.showDragonflies
-          this.insects.predators = hunted ? this.dragonflies : null
-          this.insects.update(dt, this.params)
-          if (hunted) this.dragonflies.update(dt, this.params)
-        }
         this.sampleHistory(dt)
       }
       if (steps) this.simTimer.end()
+      // The insects take the same steps in their worker.
+      if (steps && this.params.showInsects) this.insects.step(steps, dt)
+      this.insects.present()
       if (steps && this.params.showInsects) {
         // Where the shade is, for the midges: a fresh light map every half
         // sim-second (at most once a frame).
@@ -301,8 +295,8 @@ export class Engine {
         this.scum,
         this.silt,
         this.pads,
-        this.insects,
-        this.dragonflies,
+        this.insects.midges,
+        this.insects.dragonflies,
         this.params,
         this.selected,
         this.time,
@@ -369,7 +363,7 @@ export class Engine {
     this.historyClock = HISTORY_TICK
     const midges = this.params.showInsects
     const dragonflies = midges && this.params.showDragonflies
-    this.history.push([this.time, this.sim.count, midges ? this.insects.alive : null, dragonflies ? this.dragonflies.alive : null])
+    this.history.push([this.time, this.sim.count, midges ? this.insects.alive[0] : null, dragonflies ? this.insects.alive[1] : null])
     if (this.history.length > HISTORY_LENGTH) this.history.shift()
   }
 
@@ -391,10 +385,12 @@ export class Engine {
       gpuRenderMs: this.renderTimer.ms,
       frameMs: timed ? (gpuSimMs ?? 0) + this.renderTimer.ms : this.frameMs,
       count: this.sim.count,
-      midges: this.params.showInsects ? this.insects.stats() : null,
-      dragonflies: this.params.showInsects && this.params.showDragonflies ? this.dragonflies.stats() : null,
+      midges: this.params.showInsects ? this.insects.stats.midges : null,
+      dragonflies: this.params.showInsects && this.params.showDragonflies ? this.insects.stats.dragonflies : null,
       selected: this.selected >= 0 ? this.selectedInfo : null,
       history: this.history.slice(),
+      // How much of the sim speed the insects keep up with (they run in their own thread).
+      insectPace: this.params.showInsects && !this.params.paused ? this.insects.measurePace(t) : 1,
     })
   }
 
@@ -417,5 +413,6 @@ export class Engine {
     this.silt.destroy()
     this.scum.destroy()
     this.renderer.destroy()
+    this.insects.destroy()
   }
 }

@@ -87,12 +87,8 @@ export function DragonflyTab({ params: p, setParam, stats, actions }) {
         <LogSlider label="Population cap" value={p.dragonflyCap} min={1} max={1000} unlimited onChange={(v) => setParam('dragonflyCap', v)} />
         <Slider label="Energy burnt" value={p.dragonflyHunger} min={0.005} max={0.08} step={0.001} onChange={(v) => setParam('dragonflyHunger', v)} unit=" /s" />
         <Slider label="Energy per midge" value={p.dragonflyMeal} min={0.02} max={0.6} step={0.01} onChange={(v) => setParam('dragonflyMeal', v)} />
-        <Slider label="Time to digest" value={p.dragonflyDigest} min={0} max={10} step={0.25} onChange={(v) => setParam('dragonflyDigest', v)} unit=" s" />
-        <Slider label="Swarm confusion" value={p.swarmConfusion} min={0} max={1} step={0.01} onChange={(v) => setParam('swarmConfusion', v)} />
-        <Slider label="Lifespan" value={p.dragonflyLifespan} min={30} max={900} step={10} onChange={(v) => setParam('dragonflyLifespan', v)} unit=" s" />
-        <Slider label="Eggs emerge after" value={p.dragonflyHatch} min={10} max={300} step={5} onChange={(v) => setParam('dragonflyHatch', v)} unit=" s" />
         <Hint>
-          Dragonflies only gain energy by eating midges (flying fast burns more), and after a catch they don&apos;t hunt again until it is digested, so their numbers rise and fall after the midges&apos;, delayed by how long eggs take to emerge. How much a midge gives and how long it takes to digest also depend on each dragonfly&apos;s gut gene. A strike misses more often among other flying midges (swarm confusion: each one near the prey divides the chance by 1 + this), which is what swarming can evolve for. Dragonflies are slower in the shade. A midge flees a hunting dragonfly at its top speed (from as far as its vigilance gene says), so fast midges get away.
+          Dragonflies only gain energy by eating midges (flying fast burns more), and after a catch they don&apos;t hunt again until it is digested, so their numbers rise and fall after the midges&apos;, delayed by how long eggs take to emerge. Energy per midge is scaled by each dragonfly&apos;s digestion gene (quick digesters get less). A strike misses more often among other flying midges, by its swarm confusion gene, which is what swarming can evolve for. Lifespan and egg emergence time are genes too. Dragonflies are slower in the shade. A midge flees a hunting dragonfly at its top speed (from as far as its vigilance gene says), so fast midges get away.
         </Hint>
       </Section>
     </>

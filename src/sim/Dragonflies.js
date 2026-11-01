@@ -12,18 +12,21 @@ export const DRAGON_SLOTS = 128
  * (no use but to tell lineages apart: it only drifts).
  */
 export const DRAGON_GENES = [
-  { key: 'speed', label: 'Top speed', min: 40, max: 160, unit: ' px/s', hint: 'flying fast costs more energy' },
+  { key: 'speed', label: 'Top speed', min: 80, max: 240, unit: ' px/s', hint: 'flying fast costs more energy' },
   { key: 'agility', label: 'Agility', min: 150, max: 900, unit: ' px/s²', hint: 'how hard it can turn' },
   { key: 'sight', label: 'Sight', min: 40, max: 250, unit: ' px', hint: 'how far it spots a flying midge' },
   { key: 'patience', label: 'Chases for', min: 0.5, max: 5, unit: ' s' },
-  { key: 'gut', label: 'Gut', min: 0, max: 1, unit: '', hint: '0: digests a midge fast but gets little from it; 1: slowly, getting a lot' },
+  { key: 'digest', label: 'Digests in', min: 0.5, max: 2.5, unit: ' s', hint: 'quick digesters hunt again sooner but get less from a midge (0.6x the energy at the quickest, 1.4x at the slowest)' },
+  { key: 'confusion', label: 'Swarm confusion', min: 0, max: 0.28, unit: '', hint: 'each flying midge near its prey divides its strike chance by 1 + this; steadier hunters see less far (0.6x sight at 0)' },
   { key: 'ambush', label: 'Ambushes', min: 0, max: 1, unit: '', hint: 'hungry, how often it waits on a perch for midges to pass (resting is cheap, but fewer come by) instead of patrolling' },
   { key: 'territory', label: 'Territorial', min: 0, max: 1, unit: '', hint: 'chases rivals out of up to 180 px around it when not hunting (flying flat out costs energy)' },
   { key: 'huntBelow', label: 'Hunts below', min: 0.3, max: 1, unit: '', hint: 'energy below which it hunts; above, it perches or patrols' },
   { key: 'perch', label: 'Perches for', min: 1, max: 30, unit: ' s' },
   { key: 'laying', label: 'Lays', min: 0, max: 0.1, unit: ' /s' },
   { key: 'eggEnergy', label: 'Lays above', min: 0.3, max: 1, unit: '', hint: 'energy it needs to lay' },
-  { key: 'brood', label: 'Eggs per clutch', min: 1, max: 4, unit: '', hint: 'each egg takes 0.3 energy from the mother, all its dragonfly starts with' },
+  { key: 'brood', label: 'Eggs per clutch', min: 1, max: 4, unit: '', hint: 'each egg takes 0.3 energy from the mother; its dragonfly gets up to all of it' },
+  { key: 'lifespan', label: 'Lifespan', min: 120, max: 400, unit: ' s', hint: 'a longer life, but no eggs until a fifth of the way through it' },
+  { key: 'hatch', label: 'Eggs emerge after', min: 30, max: 150, unit: ' s', hint: 'quick eggs give weaker dragonflies (half the egg energy at the quickest); slow ones are lost more often' },
   { key: 'red', label: 'Red', min: 0, max: 1, unit: '' },
   { key: 'green', label: 'Green', min: 0, max: 1, unit: '' },
   { key: 'blue', label: 'Blue', min: 0, max: 1, unit: '' },
@@ -46,10 +49,9 @@ const TO_LAY = 2
 
 /**
  * A strike lands with this chance, less among other flying midges (each
- * within CONFUSE_RADIUS px of the prey divides it by 1 + `swarmConfusion`).
- * A catch gives `dragonflyMeal` energy and takes `dragonflyDigest` s to eat,
- * both scaled by the gut gene: from 0.6x the meal in 0.4x the time to 1.4x
- * in 1.6x.
+ * within CONFUSE_RADIUS px of the prey divides it by 1 + its confusion
+ * gene). A catch gives `dragonflyMeal` energy, scaled by how long it takes
+ * to digest (its digest gene): 0.6x at the quickest to 1.4x at the slowest.
  */
 const STRIKE = 0.7
 const CONFUSE_RADIUS = 12
@@ -62,7 +64,7 @@ const EVICT_PUSH = 500
 /** Cold-blooded: in full shade a dragonfly flies at most (1 - SHADE_SLOW) of its top speed. */
 const SHADE_SLOW = 0.4
 /** Flight cost: `dragonflyHunger` per s at CRUISE px/s, growing with speed squared; perched, REST of it. */
-const CRUISE = 85
+const CRUISE = 130
 const REST = 0.15
 /**
  * Energy a mother puts into each egg, and all the dragonfly that emerges
@@ -71,6 +73,9 @@ const REST = 0.15
  */
 const EGG_ENERGY = 0.3
 const EGG_RESERVE = 0.05
+/** Life-history trades, as for midges: lays only after MATURE of its lifespan; clutches lost with chance EGG_LOSS per s. */
+const MATURE = 0.2
+const EGG_LOSS = 0.003
 /** Dragonflies keep this far apart (px) and push each other off (territory). */
 const SPACING = 30
 /** Seconds between population samples, and how many are kept. */
@@ -90,14 +95,15 @@ const pack = (r, g, b) => Math.floor(r * 255) * 65536 + Math.floor(g * 255) * 25
  * only gains it by eating midges. Hungry (below its `huntBelow` gene) it
  * hunts: it chases the nearest flying midge it can see, for up to its
  * `patience`, and strikes on catching up; a midge flees at its own top speed,
- * so the faster midges get away. The gut gene trades how much a midge gives
- * against how long it takes to digest; the ambush gene has it wait on a
+ * so the faster midges get away. The digest gene trades how much a midge
+ * gives against how long it takes to digest; the confusion gene trades
+ * steadiness in a swarm against sight; the ambush gene has it wait on a
  * perch for prey (cheap, but fewer pass) instead of patrolling; the territory
  * gene has it chase rivals away when it isn't hunting. It is slower in the
  * shade (cold-blooded), and a strike misses more often in a crowd of flying
- * midges (`swarmConfusion`). Fed, it patrols, perches on a plant to rest,
+ * midges. Fed, it patrols, perches on a plant to rest,
  * or, above its `eggEnergy`, flies to the water among the plants to lay a
- * clutch. The eggs hatch `dragonflyHatch` seconds later (nymphs emerging) into
+ * clutch, once a fifth of its lifespan gene is past. The eggs hatch after its hatch gene (nymphs emerging) into
  * dragonflies carrying the mother's genes, each mutated
  * (`dragonflyMutationRate` / `dragonflyMutationSize`), up to `dragonflyCap`
  * (Infinity: no limit). The clutches show on the water, darkening as they
@@ -228,7 +234,7 @@ export class Dragonflies {
     this.z[d] = 2
     this.energy[d] = energy
     this.age[d] = 0
-    this.life[d] = params.dragonflyLifespan * (0.7 + Math.random() * 0.6)
+    this.life[d] = genome[G.lifespan] * (0.9 + Math.random() * 0.2)
     this.genes.set(genome, d * NG)
     this.generation[d] = generation
     this.ids[d] = this.nextId++
@@ -257,15 +263,32 @@ export class Dragonflies {
     if (profile) this.applyProfile(profile)
   }
 
-  /** Unit vector away from the hunting dragonflies within `radius` of (x, y), or null (Insects asks). */
+  /**
+   * Note where the hunting dragonflies are, for fleeFrom (Insects calls this
+   * before its midges move; the dragonflies don't move until it is done).
+   */
+  prepare() {
+    if (!this.hunters || this.hunters.length < this.slots * 2) this.hunters = new Float32Array(this.slots * 2)
+    let n = 0
+    for (let d = 0; d < this.slots; d++) {
+      if (this.state[d] !== FLYING || this.prey[d] < 0) continue
+      this.hunters[n * 2] = this.pos[d * 2]
+      this.hunters[n * 2 + 1] = this.pos[d * 2 + 1]
+      n++
+    }
+    this.hunterCount = n
+  }
+
+  /** Unit vector away from the hunting dragonflies within `radius` of (x, y), or null (Insects asks, after prepare()). */
   fleeFrom(x, y, radius) {
+    if (!this.hunterCount) return null
     let fx = 0
     let fy = 0
     const r2 = radius * radius
-    for (let d = 0; d < this.slots; d++) {
-      if (this.state[d] !== FLYING || this.prey[d] < 0) continue
-      const dx = x - this.pos[d * 2]
-      const dy = y - this.pos[d * 2 + 1]
+    const h = this.hunters
+    for (let n = 0; n < this.hunterCount; n++) {
+      const dx = x - h[n * 2]
+      const dy = y - h[n * 2 + 1]
       const d2 = dx * dx + dy * dy
       if (d2 > r2 || d2 < 1e-6) continue
       const k = 1 / Math.sqrt(d2)
@@ -278,7 +301,7 @@ export class Dragonflies {
 
   /**
    * @param params dragonflyCap / dragonflyStart, dragonflyHunger (energy burnt
-   *   per s at 85 px/s), dragonflyLifespan / dragonflyHatch (s),
+   *   per s at 130 px/s), dragonflyMeal (energy per midge),
    *   dragonflyMutationRate / dragonflyMutationSize, dragonflyProfile /
    *   dragonflyLocked. The rest of how a dragonfly behaves is in its genes.
    */
@@ -296,8 +319,15 @@ export class Dragonflies {
       this.spared.fill(-1)
     }
     const hunger = params.dragonflyHunger
+    // Who is about (in slot order), so the loops skip the empty slots.
+    if (!this.live || this.live.length < this.slots) this.live = new Int32Array(this.slots)
+    const live = this.live
+    let nLive = 0
+    for (let d = 0; d < this.slots; d++) if (this.state[d] !== EMPTY) live[nLive++] = d
+    this.liveCount = nLive
     let alive = 0
-    for (let d = 0; d < this.slots; d++) {
+    for (let l = 0; l < nLive; l++) {
+      const d = live[l]
       if (this.state[d] === EMPTY) continue
       const v = d * 2
       const gi = d * NG
@@ -315,6 +345,8 @@ export class Dragonflies {
       let x = this.pos[v]
       let y = this.pos[v + 1]
       const hungry = this.energy[d] < genes[gi + G.huntBelow]
+      // Steadier in a swarm, shorter-sighted.
+      const sight = genes[gi + G.sight] * (0.6 + (0.4 * genes[gi + G.confusion]) / DRAGON_GENES[G.confusion].max)
 
       if (this.state[d] === PERCHED) {
         // Resting on a plant until rested; hungry, it waits in ambush as long
@@ -327,7 +359,7 @@ export class Dragonflies {
           this.look[d] -= dt
           if (this.look[d] <= 0) {
             this.look[d] = 0.3
-            prey = this.nearestMidge(x, y, genes[gi + G.sight] * AMBUSH_SIGHT, -1)
+            prey = this.nearestMidge(x, y, sight * AMBUSH_SIGHT, -1)
           }
         }
         if (this.timer[d] <= 0 || prey >= 0) {
@@ -351,13 +383,13 @@ export class Dragonflies {
             this.spared[d] = prey
             this.look[d] = 0.5
             prey = -1
-          } else if (md[po + 3] !== MIDGE_FLYING || Math.hypot(md[po] - x, md[po + 1] - y) > genes[gi + G.sight] * 1.3) prey = -1
+          } else if (md[po + 3] !== MIDGE_FLYING || Math.hypot(md[po] - x, md[po + 1] - y) > sight * 1.3) prey = -1
         }
         this.look[d] -= dt
         if (prey < 0 && this.look[d] <= 0) {
           this.look[d] = 0.3
           this.chase[d] = 0
-          prey = this.nearestMidge(x, y, genes[gi + G.sight], this.spared[d])
+          prey = this.nearestMidge(x, y, sight, this.spared[d])
         }
       } else prey = -1
       this.prey[d] = prey
@@ -406,7 +438,8 @@ export class Dragonflies {
       const dist = Math.hypot(tx - x, ty - y)
       let ax = ((dist > 1e-3 ? ((tx - x) / dist) * speed : 0) - this.vel[v]) * 4
       let ay = ((dist > 1e-3 ? ((ty - y) / dist) * speed : 0) - this.vel[v + 1]) * 4
-      for (let e = 0; e < this.slots; e++) {
+      for (let l2 = 0; l2 < nLive; l2++) {
+        const e = live[l2]
         if (e === d || this.state[e] !== FLYING) continue
         const dx = x - this.pos[e * 2]
         const dy = y - this.pos[e * 2 + 1]
@@ -446,13 +479,14 @@ export class Dragonflies {
         const po = prey * S
         if (Math.hypot(md[po] - x, md[po + 1] - y) < 3) {
           this.prey[d] = -1
-          if (Math.random() < STRIKE / (1 + params.swarmConfusion * ins.flyingNear(prey, CONFUSE_RADIUS))) {
+          if (Math.random() < STRIKE / (1 + genes[gi + G.confusion] * ins.flyingNear(prey, CONFUSE_RADIUS))) {
             // Caught: eaten on the wing, a while to eat it.
-            const gut = genes[gi + G.gut]
+            const digest = genes[gi + G.digest]
+            const { min, max } = DRAGON_GENES[G.digest]
             ins.eaten(prey)
-            this.energy[d] = Math.min(1, this.energy[d] + params.dragonflyMeal * (0.6 + 0.8 * gut))
+            this.energy[d] = Math.min(1, this.energy[d] + params.dragonflyMeal * (0.6 + (0.8 * (digest - min)) / (max - min)))
             this.kills[d]++
-            this.eating[d] = params.dragonflyDigest * (0.4 + 1.2 * gut)
+            this.eating[d] = digest
           } else {
             this.spared[d] = prey
             this.look[d] = 0.5
@@ -502,7 +536,8 @@ export class Dragonflies {
     if (range < SPACING) return -1
     let best = range * range
     let rival = -1
-    for (let e = 0; e < this.slots; e++) {
+    for (let l = 0; l < this.liveCount; l++) {
+      const e = this.live[l]
       if (e === d || this.state[e] !== FLYING) continue
       const d2 = (this.pos[e * 2] - x) ** 2 + (this.pos[e * 2 + 1] - y) ** 2
       if (d2 < best) {
@@ -520,7 +555,7 @@ export class Dragonflies {
     const v = d * 2
     const range = 250
     this.timer[d] = 3 + Math.random() * 4
-    if (!hungry && this.energy[d] >= this.genes[gi + G.eggEnergy] && Math.random() < this.genes[gi + G.laying] * this.timer[d]) {
+    if (!hungry && this.energy[d] >= this.genes[gi + G.eggEnergy] && this.age[d] >= MATURE * this.life[d] && Math.random() < this.genes[gi + G.laying] * this.timer[d]) {
       // Into the water among the plants.
       const s = ins.spotWithin(x, y, range)
       const spot = s >= 0 ? ins.openWaterNear(ins.spots[s * 2], ins.spots[s * 2 + 1], 4, 20) : null
@@ -555,7 +590,7 @@ export class Dragonflies {
       this.clutchEggs[c] = brood
       this.clutchPos[c * 2] = x
       this.clutchPos[c * 2 + 1] = y
-      this.clutchTime[c] = params.dragonflyHatch * (0.7 + Math.random() * 0.6)
+      this.clutchTime[c] = this.genes[d * NG + G.hatch] * (0.9 + Math.random() * 0.2)
       this.clutchTotal[c] = this.clutchTime[c]
       this.clutchGenes.set(this.genes.subarray(d * NG, (d + 1) * NG), c * NG)
       this.clutchGeneration[c] = this.generation[d] + 1
@@ -573,6 +608,10 @@ export class Dragonflies {
     const locked = this.lockedProfile ? objectToDragonGenome(this.lockedProfile.genes) : null
     for (let c = 0; c < this.slots; c++) {
       if (this.clutchEggs[c] <= 0) continue
+      if (Math.random() < EGG_LOSS * dt) {
+        this.clutchEggs[c] = 0
+        continue
+      }
       this.clutchTime[c] -= dt
       if (this.clutchTime[c] > 0) {
         waiting++
@@ -585,7 +624,8 @@ export class Dragonflies {
         if (d < 0) break
         const x = this.clutchPos[c * 2] + (Math.random() - 0.5) * 10
         const y = this.clutchPos[c * 2 + 1] + (Math.random() - 0.5) * 10
-        this.spawn(d, x, y, locked ?? this.mutate(parent, params), this.clutchGeneration[c], params, EGG_ENERGY)
+        const strength = 0.5 + (0.5 * this.clutchTotal[c]) / DRAGON_GENES[G.hatch].max
+        this.spawn(d, x, y, locked ?? this.mutate(parent, params), this.clutchGeneration[c], params, EGG_ENERGY * strength)
         if (mother >= 0) this.children[mother]++
         free--
         this.alive++
@@ -627,7 +667,8 @@ export class Dragonflies {
       data[o + 4] = (this.ids[d] % 97) / 97
       data[o + 5] = this.heading[d]
       data[o + 6] = pack(this.genes[gi + G.red], this.genes[gi + G.green], this.genes[gi + G.blue])
-      data[o + 7] = this.ids[d] === this.selectedId ? 1 : 0
+      // Selected, plus 2 when perched (wings held still).
+      data[o + 7] = (this.ids[d] === this.selectedId ? 1 : 0) + (this.state[d] === PERCHED ? 2 : 0)
     }
     this.version++
   }

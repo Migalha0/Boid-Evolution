@@ -16,7 +16,7 @@ export const SPECIES = {
     genes: GENES,
     storageKey: 'midgeProfiles',
     tab: 'Midges',
-    world: ['insectHunger', 'flowerNectar', 'flowerRegrow', 'flowerRefills', 'flowerDormancy', 'insectLifespan', 'insectHatch'],
+    world: ['insectHunger', 'flowerNectar', 'flowerRegrow', 'flowerRefills', 'flowerDormancy'],
   },
   dragonfly: {
     name: 'dragonfly',
@@ -24,7 +24,7 @@ export const SPECIES = {
     genes: DRAGON_GENES,
     storageKey: 'dragonflyProfiles',
     tab: 'Dragonflies',
-    world: ['dragonflyHunger', 'dragonflyMeal', 'dragonflyDigest', 'swarmConfusion', 'dragonflyLifespan', 'dragonflyHatch', 'dragonflyCap'],
+    world: ['dragonflyHunger', 'dragonflyMeal', 'dragonflyCap'],
   },
 }
 

@@ -121,6 +121,7 @@ export class BoidRenderer {
     this.waterSurfaceProg = createProgram(gl, S.fieldVS, S.waterSurfaceFS)
     this.padProg = createProgram(gl, S.padVS, S.padFS)
     this.insectProg = createProgram(gl, S.insectVS, S.insectFS)
+    this.trailProg = createProgram(gl, S.trailVS, S.trailFS)
     this.shadeProg = createProgram(gl, S.fieldVS, S.shadeFS)
     this.logProg = createProgram(gl, S.logVS, S.logFS)
     this.siltProg = createProgram(gl, S.fieldVS, S.siltFS)
@@ -233,6 +234,16 @@ export class BoidRenderer {
     // Point buffers drawn by the insect program, one per source (midges,
     // dragonflies), made on first use.
     this.pointSets = new Map()
+    // Insect motion trails: lines of x, y, premultiplied r, g, b, a per vertex.
+    this.trailBuf = gl.createBuffer()
+    this.trailVao = gl.createVertexArray()
+    gl.bindVertexArray(this.trailVao)
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.trailBuf)
+    gl.enableVertexAttribArray(0)
+    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 24, 0)
+    gl.enableVertexAttribArray(1)
+    gl.vertexAttribPointer(1, 4, gl.FLOAT, false, 24, 8)
+    this.trailVersion = -1
     this.plantTex = null
     gl.bindVertexArray(null)
     this.plantVersion = -1
@@ -513,6 +524,7 @@ export class BoidRenderer {
       if (hunters) this.drawInsects(dragonflies, 0, time)
     }
     this.drawLogs(mapTex, 1) // above water: over everything rooted below
+    if (params.showInsects && params.insectTrails && insects.trails?.count) this.drawTrails(insects.trails) // under the bodies
     if (midges) this.drawInsects(insects, 1, time) // in the air and on the flowers
     if (hunters) this.drawInsects(dragonflies, 1, time)
     if (hasSel) {
@@ -674,6 +686,24 @@ export class BoidRenderer {
     gl.uniform2fv(u.u_elevDims, this.elevDims)
     gl.uniform1f(u.u_time, time)
     gl.drawArrays(gl.POINTS, 0, source.points)
+    gl.bindVertexArray(this.vao)
+  }
+
+  /** Motion trails of the flying insects ({ data, count, version }: GL_LINES vertices). */
+  drawTrails(trails) {
+    const gl = this.gl
+    gl.bindVertexArray(this.trailVao)
+    if (trails.version !== this.trailVersion) {
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.trailBuf)
+      gl.bufferData(gl.ARRAY_BUFFER, trails.data.subarray(0, trails.count * 6), gl.DYNAMIC_DRAW)
+      this.trailVersion = trails.version
+    }
+    const { program, u } = this.trailProg
+    gl.useProgram(program)
+    gl.uniform2f(u.u_view, this.width, this.height)
+    gl.uniform2fv(u.u_viewOffset, this.viewOffset)
+    gl.uniform2fv(u.u_cell, this.cell)
+    gl.drawArrays(gl.LINES, 0, trails.count)
     gl.bindVertexArray(this.vao)
   }
 
@@ -1078,6 +1108,8 @@ export class BoidRenderer {
       gl.deleteBuffer(set.buf)
       gl.deleteVertexArray(set.vao)
     }
+    gl.deleteBuffer(this.trailBuf)
+    gl.deleteVertexArray(this.trailVao)
     gl.deleteTexture(this.plantTex)
     gl.deleteTexture(this.bloomTex)
     gl.deleteTexture(this.scumBakeTex)

@@ -2,7 +2,7 @@ import { useCallback, useMemo, useRef, useState } from 'react'
 import BoidCanvas from './components/BoidCanvas.jsx'
 import ControlPanel from './components/ControlPanel.jsx'
 import PopulationDrawer from './components/PopulationDrawer.jsx'
-import { DEFAULT_PARAMS } from './config/defaults.js'
+import { DEFAULT_PARAMS, randomMurk } from './config/defaults.js'
 
 export default function App() {
   const [params, setParams] = useState(DEFAULT_PARAMS)
@@ -45,7 +45,10 @@ export default function App() {
         setParam={setParam}
         stats={stats}
         onReset={() => canvasRef.current?.reset()}
-        onNewMap={() => canvasRef.current?.newMap()}
+        onNewMap={() => {
+          canvasRef.current?.newMap()
+          setParams((p) => ({ ...p, ...randomMurk() }))
+        }}
         onShuffleLogs={() => canvasRef.current?.shuffleLogs()}
         onDefaults={() => setParams(DEFAULT_PARAMS)}
         midgeActions={midgeActions}

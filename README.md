@@ -29,13 +29,14 @@ Most boid demos fix their rules and tune them by hand. Here, as little as possib
 
 - Small flies that dance over flowers and scum mats, simulated on the CPU.
 - They burn energy flying (more the faster they fly), drink nectar from flowers, and lay egg rafts on the water only when well fed.
-- Their genes cover speed, search range, hunger, swarming, landing and resting, flower and scum preferences, shade, cohesion and separation, vigilance, sun-shyness, laying and brood size.
+- Their genes cover speed, search range, hunger, swarming, landing and resting, flower and scum preferences, shade, cohesion and separation, vigilance, sun-shyness, laying, brood size, lifespan and hatching time.
+- Lifespan and hatching time are trades: long-lived midges breed later, and quick eggs give weaker hatchlings while slow ones are lost more often.
 - Energy is conserved: each egg carries energy from its mother, so all of it comes from nectar.
 
 ### Dragonflies
 
 - A separate species that hunts the midges. Their numbers follow the midges' with a delay.
-- Their genes cover speed, agility, sight, chase patience, gut (fast and lean against slow and thorough digestion), ambush against patrol, territoriality, perching, laying, brood size, and an inherited body colour that shows lineages.
+- Their genes cover speed, agility, sight, chase patience, digestion time (fast and lean against slow and thorough), swarm confusion (steady in a swarm against sight), ambush against patrol, territoriality, perching, laying, brood size, lifespan, egg emergence time, and an inherited body colour that shows lineages.
 - They are cold-blooded, so they are slower in the shade. They also miss more often when the midge they strike at is in a dense swarm.
 
 ### The world

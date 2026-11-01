@@ -43,7 +43,9 @@ export const GENES = [
   { key: 'sunShy', label: 'Rests in sun', min: 0, max: 1, unit: '', hint: 'out in the sun (where dragonflies are fastest) it lands more and rests longer, and lays less' },
   { key: 'laying', label: 'Lays', min: 0, max: 0.2, unit: ' /s' },
   { key: 'eggEnergy', label: 'Lays above', min: 0.2, max: 1, unit: '', hint: 'energy it needs to lay' },
-  { key: 'brood', label: 'Eggs per raft', min: 1, max: 4, unit: '', hint: 'each egg takes 0.25 energy from the mother, all its hatchling starts with' },
+  { key: 'brood', label: 'Eggs per raft', min: 1, max: 4, unit: '', hint: 'each egg takes 0.25 energy from the mother; its hatchling gets up to all of it' },
+  { key: 'lifespan', label: 'Lifespan', min: 30, max: 150, unit: ' s', hint: 'a longer life, but no eggs until a fifth of the way through it' },
+  { key: 'hatch', label: 'Eggs hatch after', min: 5, max: 35, unit: ' s', hint: 'quick eggs give weaker hatchlings (half the egg energy at the quickest); slow ones are lost more often' },
 ]
 const NG = GENES.length
 const G = Object.fromEntries(GENES.map((g, k) => [g.key, k]))
@@ -94,6 +96,14 @@ const REST_DRAIN = 0.3
  */
 const EGG_ENERGY = 0.25
 const EGG_RESERVE = 0.05
+/**
+ * Life-history trades: a midge lays only after MATURE of its lifespan; a
+ * raft's hatchlings get EGG_ENERGY * (0.5 + 0.5 * hatch / the gene's top)
+ * (the rest is lost developing fast), and a raft is lost (eaten, swamped)
+ * with chance EGG_LOSS per second while it ripens.
+ */
+const MATURE = 0.2
+const EGG_LOSS = 0.01
 /** Flight speed (px/s) at which flying burns exactly `insectHunger`; beyond a base cost it grows with speed squared. */
 const CRUISE = 70
 /** Midge slots to start with when the population has no cap (they grow as needed). */
@@ -156,10 +166,10 @@ export const objectToGenome = (obj) => G_.objectToGenome(GENES, obj)
  * when seed() is called (the user's spawn button); if the midges die out
  * they stay gone.
  *
- * Life cycle: a midge lives for about `insectLifespan` seconds, then drops
- * where it is and lies there as a body for `insectBodyTime` seconds. Egg
- * rafts hatch after `insectHatch` seconds into new midges, as long as the
- * population is below `insectCount`.
+ * Life cycle: a midge lives for about its lifespan gene, then drops where it
+ * is and lies there as a body for `insectBodyTime` seconds. Egg rafts hatch
+ * after the mother's hatch gene into new midges, as long as the population
+ * is below `insectCount`. Both genes are trades (MATURE, EGG_LOSS).
  */
 export class Insects {
   constructor(map, pads) {
@@ -202,8 +212,12 @@ export class Insects {
     this.extinct = false
     // How midges died: old age, starvation, eaten by a dragonfly.
     this.deaths = { aged: 0, starved: 0, eaten: 0 }
+    this.eggsLost = 0
     // Whatever hunts them (Dragonflies, set by the owner): asked whom to flee.
     this.predators = null
+    // Slot by midge id (checked on use, pruned now and then), and the slot flagged as selected.
+    this.slotById = new Map()
+    this.marked = -1
     this.history = []
     this.historyClock = 0
     this.lockedProfile = null
@@ -466,13 +480,14 @@ export class Insects {
     this.genes.set(genome, i * NG)
     this.generation[i] = generation
     this.ids[i] = this.nextId++
+    this.slotById.set(this.ids[i], i)
     this.children[i] = 0
     this.laid[i] = 0
     this.vel[i * 2] = this.vel[i * 2 + 1] = 0
     this.timer[i] = 0
     this.action[i] = NONE
     this.age[i] = 0
-    this.life[i] = params.insectLifespan * (0.7 + Math.random() * 0.6)
+    this.life[i] = genome[G.lifespan] * (0.9 + Math.random() * 0.2)
     this.energy[i] = energy
     this.feed[i] = -1
     this.home[i] = -1
@@ -569,11 +584,13 @@ export class Insects {
     const data = this.data
     // Everyone alive, for picking a swarm to join.
     if (this.adults?.list.length !== this.capacity) this.adults = { list: new Int32Array(this.capacity), count: 0 }
-    this.adults.count = 0
-    for (let i = 0; i < this.capacity; i++) if (this.isAdult(i)) this.adults.list[this.adults.count++] = i
+    const adults = this.adults.list
+    let nAdults = 0
     for (let i = 0; i < this.capacity; i++) {
       const o = i * INSECT_STRIDE
-      if (data[o + 3] !== FLYING) {
+      const st = data[o + 3]
+      if (st === FLYING || st === ON_WATER || st === ON_FLOWER) adults[nAdults++] = i
+      if (st !== FLYING) {
         cellOf[i] = -1
         continue
       }
@@ -583,10 +600,34 @@ export class Insects {
       cellOf[i] = c
       start[c + 1]++
     }
+    this.adults.count = nAdults
     for (let c = 0; c < gw * gh; c++) start[c + 1] += start[c]
     const fill = this.fill?.length === gw * gh ? this.fill : (this.fill = new Int32Array(gw * gh))
     fill.set(start.subarray(0, gw * gh))
     for (let i = 0; i < this.capacity; i++) if (cellOf[i] >= 0) items[fill[cellOf[i]]++] = i
+    // Their positions in the same order, so the neighbour search reads memory
+    // in sequence (kept current as they move: see track()); and where each is.
+    if (!g.posX || g.posX.length !== this.capacity) {
+      g.posX = new Float32Array(this.capacity)
+      g.posY = new Float32Array(this.capacity)
+      g.rank = new Int32Array(this.capacity)
+    }
+    const n = start[gw * gh]
+    for (let k = 0; k < n; k++) {
+      const i = items[k]
+      g.posX[k] = data[i * INSECT_STRIDE]
+      g.posY[k] = data[i * INSECT_STRIDE + 1]
+      g.rank[i] = k
+    }
+  }
+
+  /** Midge i (in this step's grid) moved: keep the grid's copy of its position current. */
+  track(i) {
+    const g = this.grid
+    if (g.cellOf[i] < 0) return
+    const k = g.rank[i]
+    g.posX[k] = this.data[i * INSECT_STRIDE]
+    g.posY[k] = this.data[i * INSECT_STRIDE + 1]
   }
 
   /** Nectar refills; the renderer gets the new bloom now and then. */
@@ -655,7 +696,7 @@ export class Insects {
 
   /**
    * @param params insectCount (population cap, Infinity for none), insectStart (fresh flock),
-   *   insectWind (drift), insectLifespan / insectBodyTime / insectHatch (s),
+   *   insectWind (drift), insectBodyTime (s),
    *   insectHunger (energy burnt per s at cruising speed), flowerNectar (meals
    *   per flower), flowerRegrow (s to refill), flowerRefills / flowerDormancy
    *   (the flower cycle), mutationRate /
@@ -681,7 +722,11 @@ export class Insects {
     // Chance per frame of making a decision at all.
     const pDecide = dt / DECIDE
     const buzz = (JITTER * 2) / Math.sqrt(Math.max(dt, 1e-3))
-    const { start, items, w: gw, h: gh } = this.grid
+    const { start, items, w: gw, h: gh, posX, posY } = this.grid
+    const spots = this.spots
+    const predators = this.predators
+    predators?.prepare()
+    this.pruneIds()
     let alive = 0
 
     for (let i = 0; i < this.capacity; i++) {
@@ -756,7 +801,7 @@ export class Insects {
       let z = data[o + 2]
       const h = home[i]
       // A dragonfly close by: drop everything and fly away from it, flat out.
-      const flee = this.predators?.fleeFrom(x, y, FLEE_NEAR + FLEE_FAR * genes[gi + G.vigilance])
+      const flee = predators?.fleeFrom(x, y, FLEE_NEAR + FLEE_FAR * genes[gi + G.vigilance])
       if (flee) {
         this.action[i] = NONE
         energy[i] -= hunger * (FLEE_COST - 1) * (0.3 + 0.7 * (speed / CRUISE) ** 2) * dt
@@ -775,10 +820,11 @@ export class Insects {
         const ty = target[v + 1]
         ax = (tx - x) * 18 - vel[v] * 4
         ay = (ty - y) * 18 - vel[v + 1] * 4
-        tz = action === LANDING || Math.hypot(tx - x, ty - y) < 3 ? 0 : 3
+        tz = action === LANDING || (tx - x) ** 2 + (ty - y) ** 2 < 9 ? 0 : 3
       } else {
         // The dance: a weak pull home, the swarm, random buzz and drag.
-        const [hx, hy] = h >= 0 ? this.spotAt(h) : [x, y]
+        const hx = h >= 0 ? spots[h * 2] : x
+        const hy = h >= 0 ? spots[h * 2 + 1] : y
         ax = (hx - x) * HOME_PULL - vel[v] * DRAG + (Math.random() - 0.5) * buzz
         ay = (hy - y) * HOME_PULL - vel[v + 1] * DRAG + (Math.random() - 0.5) * buzz
         tz = (6 + 5 * Math.sin(this.time * 2 + data[o + 4] * 40)) * lowness
@@ -789,14 +835,16 @@ export class Insects {
         let sy = 0
         let px = 0
         let py = 0
-        for (let gy = Math.max(0, cy - 1); gy <= Math.min(gh - 1, cy + 1) && n < MAX_NEIGHBOURS; gy++) {
-          for (let gx = Math.max(0, cx - 1); gx <= Math.min(gw - 1, cx + 1) && n < MAX_NEIGHBOURS; gx++) {
+        const gy1 = Math.min(gh - 1, cy + 1)
+        const gx0 = Math.max(0, cx - 1)
+        const gx1 = Math.min(gw - 1, cx + 1)
+        for (let gy = Math.max(0, cy - 1); gy <= gy1 && n < MAX_NEIGHBOURS; gy++) {
+          for (let gx = gx0; gx <= gx1 && n < MAX_NEIGHBOURS; gx++) {
             const c = gy * gw + gx
             for (let k = start[c]; k < start[c + 1] && n < MAX_NEIGHBOURS; k++) {
-              const j = items[k]
-              if (j === i) continue
-              const dx = data[j * INSECT_STRIDE] - x
-              const dy = data[j * INSECT_STRIDE + 1] - y
+              if (items[k] === i) continue
+              const dx = posX[k] - x
+              const dy = posY[k] - y
               const d2 = dx * dx + dy * dy
               if (d2 > NEIGHBOUR_RADIUS * NEIGHBOUR_RADIUS) continue
               n++
@@ -821,7 +869,7 @@ export class Insects {
       }
       vel[v] += ax * dt
       vel[v + 1] += ay * dt
-      const sp = Math.hypot(vel[v], vel[v + 1])
+      const sp = Math.sqrt(vel[v] * vel[v] + vel[v + 1] * vel[v + 1])
       const cap = action !== NONE ? speed * 0.5 : speed
       if (sp > cap) {
         vel[v] *= cap / sp
@@ -836,17 +884,19 @@ export class Insects {
       data[o] = Math.min(Math.max(x, 0), map.width)
       data[o + 1] = Math.min(Math.max(y, 0), map.height)
       data[o + 2] = z
+      this.track(i)
 
       if (action !== NONE) {
         const tx = target[v]
         const ty = target[v + 1]
-        if (Math.hypot(tx - x, ty - y) < 1.5 && z < 0.6) {
+        if ((tx - x) ** 2 + (ty - y) ** 2 < 2.25 && z < 0.6) {
           vel[v] = vel[v + 1] = 0
           this.action[i] = NONE
           if (action === LANDING) {
             // Touch down.
             data[o] = tx
             data[o + 1] = ty
+            this.track(i)
             data[o + 2] = 0
             data[o + 3] = this.onFlower[i] ? ON_FLOWER : ON_WATER
             if (!this.onFlower[i]) this.ripple(tx, ty)
@@ -893,7 +943,7 @@ export class Insects {
         home[i] = this.pickHome(i, x, y)
       } else if (u < wander + laying) {
         // Only a well-fed midge has eggs to lay.
-        if (energy[i] < genes[gi + G.eggEnergy]) continue
+        if (energy[i] < genes[gi + G.eggEnergy] || this.age[i] < MATURE * this.life[i]) continue
         const [hx, hy] = h >= 0 ? this.spotAt(h) : [x, y]
         const spot = this.nurseryNear(hx, hy)
         if (!spot) continue
@@ -996,7 +1046,7 @@ export class Insects {
       this.data[o + 2] = 0
       this.data[o + 3] = EGGS
       this.data[o + 4] = Math.random()
-      this.data[o + 5] = params.insectHatch * (0.7 + Math.random() * 0.6) // seconds to hatching
+      this.data[o + 5] = this.genes[i * NG + G.hatch] * (0.9 + Math.random() * 0.2) // seconds to hatching
       this.data[o + 6] = 0
       this.data[o + 7] = brood
       this.eggGenes.set(this.genes.subarray(i * NG, (i + 1) * NG), e * NG)
@@ -1021,6 +1071,11 @@ export class Insects {
     for (let e = 0; e < this.eggSlots; e++) {
       const o = (this.capacity + e) * INSECT_STRIDE
       if (data[o + 3] !== EGGS) continue
+      if (Math.random() < EGG_LOSS * dt) {
+        data[o + 3] = EMPTY
+        this.eggsLost++
+        continue
+      }
       data[o + 6] += dt / data[o + 5]
       if (data[o + 6] < 1) {
         waiting++
@@ -1034,7 +1089,8 @@ export class Insects {
         while (slot < this.capacity && data[slot * INSECT_STRIDE + 3] !== EMPTY) slot++
         if (slot >= this.capacity) break
         const genome = locked ?? this.mutate(Array.from(parent), params)
-        this.spawn(slot, data[o], data[o + 1], 0.5, genome, this.eggGeneration[e], this.eggMother[e], params, EGG_ENERGY)
+        const strength = 0.5 + (0.5 * data[o + 5]) / GENES[G.hatch].max
+        this.spawn(slot, data[o], data[o + 1], 0.5, genome, this.eggGeneration[e], this.eggMother[e], params, EGG_ENERGY * strength)
         if (mother >= 0) this.children[mother]++
         free--
       }
@@ -1045,8 +1101,17 @@ export class Insects {
   /** The slot of the living midge with this id, or -1. */
   slotOf(id) {
     if (!id) return -1
-    for (let i = 0; i < this.capacity; i++) if (this.ids[i] === id && this.isAdult(i)) return i
+    const i = this.slotById.get(id)
+    if (i !== undefined && i < this.capacity && this.ids[i] === id && this.isAdult(i)) return i
+    this.slotById.delete(id)
     return -1
+  }
+
+  /** Forget the ids of the dead (they are only cleared when looked up). */
+  pruneIds() {
+    if (this.slotById.size < 4 * Math.max(this.capacity, 256)) return
+    this.slotById.clear()
+    for (let i = 0; i < this.capacity; i++) if (this.isAdult(i)) this.slotById.set(this.ids[i], i)
   }
 
   /** Other midges flying within `r` px of midge i (r up to NEIGHBOUR_RADIUS; from this frame's grid). */
@@ -1098,7 +1163,12 @@ export class Insects {
   /** Flag the selected midge for the renderer (data[7] of a midge; rafts use it for their brood). */
   markSelected() {
     const s = this.slotOf(this.selectedId)
-    for (let i = 0; i < this.capacity; i++) this.data[i * INSECT_STRIDE + 7] = i === s ? 1 : 0
+    if (s !== this.marked) {
+      // A midge's flag is cleared when its slot is reused (spawn), so only these two change.
+      if (this.marked >= 0 && this.marked < this.capacity) this.data[this.marked * INSECT_STRIDE + 7] = 0
+      if (s >= 0) this.data[s * INSECT_STRIDE + 7] = 1
+      this.marked = s
+    }
     this.version++
   }
 
@@ -1162,6 +1232,7 @@ export class Insects {
     return {
       resting,
       deaths: { ...this.deaths },
+      eggsLost: this.eggsLost,
       alive: this.alive,
       eggs,
       swarms,

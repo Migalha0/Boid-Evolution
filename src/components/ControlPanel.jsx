@@ -198,6 +198,11 @@ export default function ControlPanel({ params, setParam, stats, onReset, onNewMa
           )}
 
           <Slider label="Sim speed" value={p.simSpeed} min={1} max={30} step={1} onChange={(v) => setParam('simSpeed', v)} unit="×" />
+          {p.showInsects && stats.insectPace < 0.95 && (
+            <Hint>
+              The insects can only keep up with about {Math.max(1, p.simSpeed * stats.insectPace).toFixed(0)}× here (they run on one CPU core of their own): they live slower than the fish, but every step is still a full one, so evolution is the same, only slower. For fast training use <code>npm run train</code> (headless, hundreds of times real time).
+            </Hint>
+          )}
 
           <SelectedMidge midge={stats.midges?.selected} />
           <SelectedDragonfly dragonfly={stats.dragonflies?.selected} />
@@ -415,6 +420,7 @@ export default function ControlPanel({ params, setParam, stats, onReset, onNewMa
                     ]}
                   />
                 </div>
+                <Toggle label="Insect motion trails" checked={p.insectTrails} onChange={(v) => setParam('insectTrails', v)} />
                 <Toggle label="Velocity vector" checked={p.showVelocity} onChange={(v) => setParam('showVelocity', v)} swatch="bg-gradient-to-r from-sky-400 to-amber-400" />
                 <Toggle label="Steering vector" checked={p.showSteering} onChange={(v) => setParam('showSteering', v)} swatch="bg-gradient-to-r from-purple-500 to-pink-500" />
               </Section>

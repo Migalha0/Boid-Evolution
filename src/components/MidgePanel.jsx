@@ -50,7 +50,7 @@ export function MidgeTab({ params: p, setParam, stats, actions }) {
               <br />
               generation {pop ? `${pop.generation.toFixed(1)} (max ${pop.maxGeneration})` : '–'} · {m.extinct ? 'extinct' : `died out ${m.extinctions}×`}
               <br />
-              died: {m.deaths.aged} old · {m.deaths.starved} starved · {m.deaths.eaten} eaten
+              died: {m.deaths.aged} old · {m.deaths.starved} starved · {m.deaths.eaten} eaten · {m.eggsLost} rafts lost
               <br />
               flowers: {m.dry} drunk dry · {m.resting} resting / {m.flowers} · {(m.time / 60).toFixed(1)} min
             </p>
@@ -87,12 +87,10 @@ export function MidgeTab({ params: p, setParam, stats, actions }) {
       <Section title="World" fold>
         <LogSlider label="Population cap" value={p.insectCount} min={10} max={5000} unlimited onChange={(v) => setParam('insectCount', v)} />
         <Slider label="Energy burnt" value={p.insectHunger} min={0.002} max={0.08} step={0.001} onChange={(v) => setParam('insectHunger', v)} unit=" /s" />
-        <Slider label="Lifespan" value={p.insectLifespan} min={10} max={600} step={5} onChange={(v) => setParam('insectLifespan', v)} unit=" s" />
-        <Slider label="Eggs hatch after" value={p.insectHatch} min={2} max={120} step={1} onChange={(v) => setParam('insectHatch', v)} unit=" s" />
         <Slider label="Bodies last" value={p.insectBodyTime} min={1} max={60} step={1} onChange={(v) => setParam('insectBodyTime', v)} unit=" s" />
         <Slider label="Carried by the wind" value={p.insectWind} min={0} max={2} step={0.05} onChange={(v) => setParam('insectWind', v)} />
         <Hint>
-          What the midges live in, not part of their genes. Energy is burnt flying (more the faster) and refilled by drinking from flowers. Keep the cap above what the flowers can feed (or at ∞) so food, not the cap, decides who breeds.
+          What the midges live in, not part of their genes (lifespan and hatching time are genes now). Energy is burnt flying (more the faster) and refilled by drinking from flowers. Keep the cap above what the flowers can feed (or at ∞) so food, not the cap, decides who breeds.
         </Hint>
         <h4 className="pt-1 text-[11px] text-slate-400">Flowers</h4>
         <Slider label="Nectar per flower" value={p.flowerNectar} min={0.05} max={2} step={0.05} onChange={(v) => setParam('flowerNectar', v)} unit=" meals" />

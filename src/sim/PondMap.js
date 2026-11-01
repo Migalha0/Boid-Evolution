@@ -9,6 +9,12 @@ export const SDF_CELL = 3
 export const LAND_LEVEL = 0.8
 /** Elevation where aquatic vegetation starts to appear. */
 const VEG_START = 0.5
+/**
+ * Even where the shallows are planted, plants in the water stand this far
+ * apart (as a share of the land's cover), so water shows between them; only
+ * a narrow fringe along the bank grows thick, so the bank's edge never shows.
+ */
+const WATER_COVER = 0.45
 /** Field label for reed beds in the water (behaviour hook, neutral for now). */
 export const REEDS = 1
 
@@ -320,7 +326,9 @@ export class PondMap {
         // otherwise, open up in gaps.
         const lush = smoothstep(0.45, 0.9, shallow)
         const thin = (1 - this.sparseness * (1 - lush)) * (1 - lush + lush * unGapped(x, y, d))
-        if (rand() > Math.min(1, shallow ** 1.4 * 1.2 * patch) * thin) continue
+        const fringe = 1 - smoothstep(4, 16, d)
+        const cover = 1 - lush * (1 - fringe) * (1 - WATER_COVER)
+        if (rand() > Math.min(1, shallow ** 1.4 * 1.2 * patch) * thin * cover) continue
         const r = rand()
         // The deep edge grows only rush, but takes from the middle mix in its place.
         const mix = shallow > 0.7 ? SHALLOW : MIDDLE

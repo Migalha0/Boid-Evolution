@@ -1276,7 +1276,7 @@ void main() {
   // Point size per mode and state; 0 = not drawn in this mode.
   float size = 0.0;
   if (u_mode == 0) size = state == 1 ? 8.0 : state == 4 ? 2.0 : state == 5 ? 4.0 : state == 7 ? 16.0 : state == 9 ? 8.0 : 0.0;
-  else if (u_mode == 1) size = state == 8 ? (a_look.w > 0.5 ? 18.0 : 12.0) : state <= 2 && a_look.w > 0.5 ? 14.0 : state == 0 || state == 2 || state == 3 ? 2.0 : 0.0;
+  else if (u_mode == 1) size = state == 8 ? (mod(a_look.w, 2.0) > 0.5 ? 18.0 : 12.0) : state <= 2 && a_look.w > 0.5 ? 14.0 : state == 0 || state == 2 || state == 3 ? 2.0 : 0.0;
   else size = state == 1 ? 8.0 : state == 0 || state == 3 ? 2.0 : state == 8 ? 4.0 : 0.0;
   gl_PointSize = 1.0;
   if (size == 0.0) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
@@ -1299,6 +1299,33 @@ void main() {
   // a_look.w: selected (midges, dragonflies) or eggs in the clutch (dragonfly eggs).
   v_selected = state <= 2 || state >= 8 ? a_look.w : 0.0;
   v_state = float(state);
+}
+`
+
+// Motion trails of flying insects (engine/InsectWorld.js builds them): lines
+// through each one's last few positions, in scene pixels like insectVS, with
+// premultiplied colours fading towards the tail.
+export const trailVS = /* glsl */ `#version 300 es
+precision highp float;
+layout(location = 0) in vec2 a_pos;
+layout(location = 1) in vec4 a_colour;
+uniform vec2 u_view;
+uniform vec2 u_viewOffset;
+uniform vec2 u_cell;
+out vec4 v_colour;
+void main() {
+  vec2 uv = ((a_pos - u_viewOffset) / u_cell + 0.5) / (u_view / u_cell);
+  gl_Position = vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 0.0, 1.0);
+  v_colour = a_colour;
+}
+`
+
+export const trailFS = /* glsl */ `#version 300 es
+precision highp float;
+in vec4 v_colour;
+out vec4 o;
+void main() {
+  o = v_colour;
 }
 `
 
@@ -1338,7 +1365,7 @@ void main() {
     o = premul(vec3(0.0, 0.02, 0.05), a);
     return;
   }
-  if (u_mode == 1 && v_selected > 0.5) {
+  if (u_mode == 1 && (state == 8 ? mod(v_selected, 2.0) : v_selected) > 0.5) {
     // The selected midge: an amber ring around it (its body is drawn here too,
     // except on the water where mode 0 draws it).
     float r = length(lp);
@@ -1362,7 +1389,8 @@ void main() {
       o = vec4(q.x > 2.0 ? colour * 0.35 : colour, 1.0);
       return;
     }
-    float beat = 0.5 + 0.5 * sin(u_time * 60.0 + seed * 40.0);
+    // Perched (v_selected >= 2) the wings are held still, spread flat.
+    float beat = v_selected >= 1.5 ? 0.3 : 0.5 + 0.5 * sin(u_time * 60.0 + seed * 40.0);
     if ((abs(q.x - 1.2) < 0.9 || abs(q.x + 0.6) < 0.9) && abs(q.y) < 4.5 + beat) {
       o = premul(vec3(0.82, 0.88, 0.92), 0.35 + 0.2 * beat);
       return;

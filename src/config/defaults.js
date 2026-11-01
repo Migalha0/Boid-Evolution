@@ -46,9 +46,9 @@ export const DEFAULT_PARAMS = {
   showWaterMotion: true, // deep-water swirl, shallow caustics and ripples
   murkSurface: 0.18, // how much a fish right below the surface fades into the water
   murkDeep: 0.88, // ... and one on the deepest bottom
-  swirlStrength: 0.18, // brightness change of the deep-water silt swirl
+  swirlStrength: 0.07, // brightness change of the deep-water silt swirl
   swirlSize: 900, // world px per swirl noise tile
-  swirlSpeed: 0.012, // noise tiles per second the eddies turn over
+  swirlSpeed: 0.004, // noise tiles per second the eddies turn over
   causticStrength: 0.03, // brightness of a caustic line
   causticDepth: 0.65, // water depth (0..1) beyond which no caustics reach the floor
   causticSize: 240, // world px per caustic noise tile
@@ -79,32 +79,27 @@ export const DEFAULT_PARAMS = {
   floorStones: 0.4, // pebble beds in the shallows
   floorTwigs: 0.3, // sunken twigs and branches
   showInsects: true,
+  insectTrails: true, // fading motion trails behind flying midges and dragonflies (they show when fast-forwarding)
   // Midges: how each one behaves is in its genes (sim/Insects.js GENES); these are the world they live in.
-  insectCount: 2000, // most midges alive at once (kept above what the flowers feed, so food limits them)
+  insectCount: Infinity, // most midges alive at once (Infinity: no limit, so food decides)
   insectStart: 100, // midges per spawn (random genomes, or the profile's); nothing spawns by itself
   insectWind: 1, // how far the wind carries them
-  insectLifespan: 90, // seconds a midge lives
   insectBodyTime: 12, // seconds a body lies before it is gone
-  insectHatch: 20, // seconds until an egg raft hatches
   insectHunger: 0.03, // energy a midge burns per second flying at 70 px/s (full = 1)
-  flowerNectar: 0.35, // meals (full energy) a flower holds
-  flowerRegrow: 100, // seconds a drunk-dry flower takes to refill
-  flowerRefills: 5, // refills before a flower wilts and rests (0 = never), varied per flower
-  flowerDormancy: 120, // seconds a wilted flower rests before refilling, varied per flower
+  flowerNectar: 1, // meals (full energy) a flower holds
+  flowerRegrow: 50, // seconds a drunk-dry flower takes to refill
+  flowerRefills: 6, // refills before a flower wilts and rests (0 = never), varied per flower
+  flowerDormancy: 100, // seconds a wilted flower rests before refilling, varied per flower
   // Dragonflies: an evolving predator population (their behaviour is in their genes)
   showDragonflies: true,
   dragonflyMutationRate: 0.1, // chance each gene mutates in a newly emerged dragonfly
   dragonflyMutationSize: 0.08, // typical mutation, as a fraction of the gene's range
   dragonflyProfile: null, // the chosen dragonfly profile, if any
   dragonflyLocked: false, // every dragonfly carries the profile's genome exactly, no mutations
-  dragonflyCap: 48, // most dragonflies alive at once
+  dragonflyCap: Infinity, // most dragonflies alive at once (Infinity: no limit)
   dragonflyStart: 6, // dragonflies per spawn (random genes, or the profile's); nothing spawns by itself
-  dragonflyHunger: 0.025, // energy a dragonfly burns per second flying at 85 px/s (a midge gives 0.15)
-  dragonflyMeal: 0.15, // energy a dragonfly gets from a midge (scaled by its gut gene)
-  dragonflyDigest: 2, // seconds a dragonfly spends eating a midge before it hunts again (scaled by its gut gene)
-  swarmConfusion: 0.15, // each flying midge near the prey divides a dragonfly's strike chance by 1 + this
-  dragonflyLifespan: 240, // seconds a dragonfly lives
-  dragonflyHatch: 90, // seconds until a clutch of eggs emerges as dragonflies
+  dragonflyHunger: 0.025, // energy a dragonfly burns per second flying at 130 px/s
+  dragonflyMeal: 0.38, // energy a dragonfly gets from a midge (scaled by its digestion gene)
   mutationRate: 0.1, // chance each gene mutates in a hatchling
   mutationSize: 0.08, // typical mutation, as a fraction of the gene's range
   midgeProfile: null, // the chosen profile ({ name, genes, ... }), if any
@@ -135,4 +130,13 @@ export const DEFAULT_PARAMS = {
   colorLevels: 24, // colour levels per channel (lo-fi palette depth)
   dithering: true, // ordered (Bayer) dithering between colour levels
   vignette: 0.45, // darkening towards the corners
+}
+
+/**
+ * Murk for a new map: every pond's water is a little different, from clearer
+ * to murkier (ranges kept around the defaults so it always reads as a pond).
+ */
+export function randomMurk() {
+  const r = (a, b) => Math.round((a + Math.random() * (b - a)) * 100) / 100
+  return { murkSurface: r(0.05, 0.35), murkDeep: r(0.65, 0.97), logMurk: Math.round(r(1.5, 4) * 10) / 10 }
 }
