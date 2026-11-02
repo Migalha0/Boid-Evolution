@@ -1,6 +1,7 @@
 import { LOG_ELEV_PER_PX } from '../sim/Logs.js'
 import { LAND_LEVEL } from '../sim/PondMap.js'
-import { RIPPLE_LIFE } from '../sim/Insects.js'
+/** Seconds a ripple ring lasts (insectFS). */
+const RIPPLE_LIFE = 0.9
 import { LAND_FLAG } from '../sim/Vegetation.js'
 
 // Boid data is read straight from the simulation textures with texelFetch,
@@ -46,7 +47,7 @@ void basisFrom(vec2 v, out vec2 f, out vec2 r, out float m) {
 const TUNE = /* glsl */ `
 #ifndef TUNE_BLOCK
 #define TUNE_BLOCK
-layout(std140) uniform Tunables { highp vec4 u_tune[7]; };
+layout(std140) uniform Tunables { highp vec4 u_tune[8]; };
 #define SHADOW u_tune[0].x            // light let through a shadow
 #define PLANT_SELF_SHADE u_tune[0].y  // light reaching shaded plant bases
 #define MURK_SURFACE u_tune[0].z      // fish fade right below the surface
@@ -75,14 +76,16 @@ layout(std140) uniform Tunables { highp vec4 u_tune[7]; };
 #define DEEP_FADE u_tune[6].y         // how much deep fish lose colour and sharpness
 #define SILT_OPACITY u_tune[6].z      // opacity of the densest silt cloud
 #define SLUDGE u_tune[6].w            // how much of the shallow-mid floor the sludge covers
+#define DEPTH_EFFECT u_tune[7].x      // 1 = as set; higher: things fade and darken sooner with depth
 // How far something at this depth (0 = surface .. 1 = deepest floor) has
-// faded into the water: fish, the floor, and the shadows on it alike.
-float murkAt(float depth) { return mix(MURK_SURFACE, MURK_DEEP, depth); }
+// faded into the water: fish, the floor, and the shadows on it alike;
+// DEPTH_EFFECT strengthens it (what is left of the view, raised to it).
+float murkAt(float depth) { return 1.0 - pow(1.0 - mix(MURK_SURFACE, MURK_DEEP, depth), DEPTH_EFFECT); }
+// Depth as the water's colour shows it: deeper sooner with DEPTH_EFFECT.
+float depthLook(float depth) { return 1.0 - pow(1.0 - depth, DEPTH_EFFECT); }
 #endif
 `
 
-/** Scene pixels per texel of the coarse light map (shadeFS). */
-export const SHADE_CELL = 8
 
 // Hard shadows: a scene-resolution mask of projected silhouettes, sampled at
 // the fragment's own pixel; one flat darkness, no gradients.
@@ -210,8 +213,30 @@ const CLOUDS = /* glsl */ `${TUNE}
 uniform sampler2D u_clouds;  // tiling noise (clouds.js)
 uniform vec2 u_cloudShift;   // how far the wind has carried the clouds (world px)
 uniform vec2 u_wind;         // unit vector the wind blows towards
+uniform vec4 u_windPair;     // the two fixed directions the wind is between (A.xy, B.xy)
+uniform float u_windMix;     // how far from A to B it is, 0..1
+uniform vec2 u_windTravel;   // how far the wind has blown (integral of u_wind dt, s)
+uniform vec2 u_causticShift; // how far the caustics have drifted downwind (caustic noise tiles)
 
 float cloud(vec2 p) { return texture(u_clouds, p).r; }
+
+// Patterns stretched or travelling along the wind (cloud wisps, ripples)
+// are drawn for two fixed directions, A and B, and cross-faded by u_windMix.
+// Turning the wind never rotates a pattern (a turn about the origin would
+// sweep it across the screen) or switches one abruptly: the old direction's
+// fades out as the new one's fades in, continuously.
+vec2 windA() { return u_windPair.xy; }
+vec2 windB() { return u_windPair.zw; }
+// Mixing two independent waves lowers their amplitude mid-fade; dividing by
+// this keeps crests as tall.
+float windMixNorm() { float w = u_windMix; return inversesqrt(w * w + (1.0 - w) * (1.0 - w)); }
+
+// Wisps along the wind direction wd: 0 torn away .. 1 whole.
+float cloudStreak(vec2 p, vec2 s, vec2 wd) {
+  vec2 along = vec2(dot(p, wd), dot(p, vec2(-wd.y, wd.x)));
+  float streak = cloud(vec2(along.x * 3.0, along.y * 15.0) - dot(s, wd) * 3.6 + 0.5);
+  return smoothstep(0.3, 0.7, streak);
+}
 
 // 0 = clear sky .. 1 = cloud core.
 float cloudCover(vec2 world) {
@@ -228,14 +253,12 @@ float cloudCover(vec2 world) {
   float d = smoothstep(CLOUD_COVER, CLOUD_COVER + CLOUD_EDGE, n);
   // Wisps: fine noise stretched 5x along the wind tears the thin edges into
   // streaks; the cores (d -> 1) stay whole.
-  vec2 along = vec2(dot(p, u_wind), dot(p, vec2(-u_wind.y, u_wind.x)));
-  vec2 sAlong = vec2(dot(s, u_wind), 0.0);
-  float streak = cloud(vec2(along.x * 3.0, along.y * 15.0) - sAlong * 3.6 + 0.5);
-  return d * mix(smoothstep(0.3, 0.7, streak), 1.0, d * d);
+  float streak = mix(cloudStreak(p, s, windA()), cloudStreak(p, s, windB()), u_windMix);
+  return d * mix(streak, 1.0, d * d);
 }
 `
 
-// Koi palette: gold, blue, white, orange, black (order = BOID_COLORS in GpuBoidSim).
+// Koi palette: gold, blue, white, orange, black (order = BOID_COLORS in species/fish.js).
 // The fish is a little spine mesh built from gl_VertexID: 4 body segments
 // from the nose (x = 1.6) to the tail root (x = -1.0), then the caudal fin.
 // Seen from above a fish's tail fin is vertical, so it is just a thin slit. The body undulates with a travelling wave whose amplitude grows
@@ -268,11 +291,17 @@ uniform vec2 u_light;  // shadow offset per px of height, away from the sun
 uniform sampler2D u_elev;
 uniform float u_elevCell;
 uniform vec2 u_elevDims;
+// The selected fish (-1: none): the fish it sees (within u_focusRange and
+// its field of view, as the sim's consider() tests) are lit up.
+uniform int u_focusId;
+uniform float u_focusRange;
+uniform float u_focusCosFov;
 out vec4 v_color;
 out float v_swimDepth; // 0 = at the surface .. 1 = on the bottom; < 0 = not murked
 out vec2 v_world;
-out float v_edge; // -1 .. 1 across the body
-out float v_blur; // 0 = crisp .. 1 = deep fish, edges faded out
+out float v_blur;   // 0 = crisp .. 1 = deep fish, out of focus
+out vec3 v_body;    // body: (along, across from the spine, half-width there), in body sizes
+out float v_halo;   // how far the blur reaches past the outline (body sizes; 0 = crisp)
 out vec2 v_soft;  // shadow: position in its soft blob (0 = centre, 1 = faded out)
 const float LAND = ${LAND_LEVEL.toFixed(4)};
 const float ELEV_PER_PX = ${LOG_ELEV_PER_PX.toFixed(6)};
@@ -283,21 +312,36 @@ void main() {
   v_swimDepth = -1.0;
   v_soft = vec2(0.0);
   v_blur = 0.0;
+  v_halo = 0.0;
   vec2 f, r; float m;
   basisFrom(s.zw, f, r, m);
+  // Where it swims now, rising over or diving under trunks (the sim's aux.z fraction).
+  float swim = fract(aux.z);
+  float floorE = texture(u_elev, (s.xy / u_elevCell + 0.5) / u_elevDims).r;
+  float depth = clamp((LAND - floorE) / LAND, 0.0, 1.0); // water depth here, 0..1
+  // Deep fish are out of focus: the mesh grows by the blur's reach past the
+  // true outline (on every side, the snout too) and boidFS fades the halo
+  // out by the distance to that outline. The shape itself never widens.
+  if (u_mode == 0) {
+    v_blur = DEEP_FADE * smoothstep(0.1, 0.7, swim * depth);
+    v_halo = v_blur * max(0.4, 2.0 * u_pixel / max(u_size, 1e-3));
+  }
   vec2 local;
+  float half_;
   if (gl_VertexID < 24) {
     int seg = gl_VertexID / 6;
     vec2 q = Q[gl_VertexID - seg * 6];
     int node = seg + int(q.x);
-    local = vec2(SPINE[node], WIDTH[node] * q.y);
-    v_edge = q.y;
+    half_ = WIDTH[node];
+    local = vec2(SPINE[node] + (node == 0 ? v_halo : 0.0), (half_ + v_halo) * q.y);
   } else {
-    v_edge = 0.0;
     local = FIN[gl_VertexID - 24];
     // At least a pixel wide, so the slit never breaks up into dots.
-    local.y = sign(local.y) * max(abs(local.y), 0.5 * u_pixel / max(u_size, 1e-3));
+    half_ = max(abs(local.y), 0.5 * u_pixel / max(u_size, 1e-3));
+    local.y = sign(local.y) * (half_ + v_halo);
+    if (local.x < -1.7) local.x -= v_halo;
   }
+  v_body = vec3(local, half_);
   // Travelling wave from head to tail; amplitude ~ (distance from nose)^2.
   float back = (1.6 - local.x) / 3.35;
   float phase = aux.w + traits.z * 6.2832;
@@ -305,18 +349,17 @@ void main() {
   // Turning: the body bends into an arc around the turn centre.
   float turn = clamp(dot(aux.xy, r) / max(u_maxForce, 1.0), -1.0, 1.0);
   local.y += turn * 0.07 * (local.x - 0.3) * (local.x - 0.3);
-  float floorE = texture(u_elev, (s.xy / u_elevCell + 0.5) / u_elevDims).r;
-  float depth = clamp((LAND - floorE) / LAND, 0.0, 1.0); // water depth here, 0..1
-  // Where it swims now, rising over or diving under trunks (the sim's aux.z fraction).
-  float swim = fract(aux.z);
-  if (u_mode == 0) {
-    // Deep fish blur: the body widens a little and its rim fades (see boidFS).
-    v_blur = DEEP_FADE * smoothstep(0.1, 0.7, swim * depth);
-    local.y *= 1.0 + 0.7 * v_blur;
-  }
-  vec2 p = s.xy + (f * local.x + r * local.y) * u_size + u_shift;
+  // Deeper is further from the eye: a little smaller.
+  vec2 p = s.xy + (f * local.x + r * local.y) * u_size * (1.0 - 0.12 * v_blur) + u_shift;
   if (u_mode == 0) {
     vec3 c = PALETTE[clamp(int(traits.x), 0, 4)];
+    if (u_focusId >= 0 && boidId() != u_focusId) {
+      vec4 fs = texelFetch(u_state, coordOf(u_focusId), 0);
+      vec2 d = s.xy - fs.xy;
+      float d2 = dot(d, d);
+      vec2 fh = length(fs.zw) > 0.0 ? normalize(fs.zw) : vec2(1.0, 0.0);
+      if (d2 <= u_focusRange * u_focusRange && dot(d, fh) >= u_focusCosFov * sqrt(d2)) c = mix(c, vec3(1.0, 0.95, 0.75), 0.6);
+    }
     // Slightly lighter nose so dark koi still read on deep water.
     v_color = vec4(mix(c, vec3(0.9), 0.15 * step(1.0, local.x)), 1.0);
     v_swimDepth = swim;
@@ -342,6 +385,20 @@ void main() {
 }
 `
 
+// Silt stirred up from the floor (SiltField), as seen: a haze of fine
+// sediment a little lighter and muddier than the water there, low in the
+// water so it is seen through nearly the whole column above it (murked like
+// the floor), thin at its fringe. d: cloud density; water: the water's
+// colour there, depth: its depth (0..1). Needs TUNE.
+const SILT_LOOK = /* glsl */ `
+vec4 siltLook(float d, vec3 water, float depth) {
+  vec3 mud = mix(water * 1.3, vec3(0.45, 0.41, 0.32), 0.35);
+  vec3 c = mix(mud, water, murkAt(depth * 0.8) * 0.7);
+  float a = SILT_OPACITY * smoothstep(0.02, 0.45, d) * 0.85;
+  return vec4(c, a);
+}
+`
+
 // Murky water: a fish fades into the water around it the deeper it swims.
 // The cached background holds the unshaded water colour (rgb) and the water
 // depth there (a); each fish has its own preferred depth (traits.y) as a
@@ -352,13 +409,17 @@ precision highp float;
 in vec4 v_color;
 in float v_swimDepth;
 in highp vec2 v_world;
-in float v_edge;
 in float v_blur;
+in vec3 v_body;
+in float v_halo;
 in vec2 v_soft;
 uniform sampler2D u_background;
 uniform highp sampler2D u_trunks; // baked trunk map (MapTextures): r = trunk top elevation, -1 = none
+uniform sampler2D u_silt;         // stirred silt density (SiltField)
+uniform vec2 u_siltExtent;
 out vec4 o;
 ${MASK}
+${SILT_LOOK}
 void main() {
   vec3 c = v_color.rgb;
   bool submerged = v_swimDepth >= 0.0;
@@ -371,10 +432,24 @@ void main() {
     float below = v_swimDepth * water.a; // depth below the surface, 0..1
     // Deeper down the colour drains away (before the murk takes over).
     c = mix(c, vec3(dot(c, vec3(0.3, 0.59, 0.11))), DEEP_FADE * smoothstep(0.1, 0.7, below));
-    c = underWater(c, below, vec3(1.0), murkAt(below), water.rgb, water.a);
+    // Out of focus, it takes on more of the water's colour too.
+    c = underWater(c, below, vec3(1.0), min(1.0, murkAt(below) + 0.25 * v_blur), water.rgb, water.a);
+    // Swimming low, inside a silt cloud it stirred: veiled by it like the floor.
+    if (SILT_OPACITY > 0.0 && v_swimDepth > 0.45) {
+      vec4 cloud = siltLook(texture(u_silt, v_world / u_siltExtent).r, water.rgb, water.a);
+      c = mix(c, cloud.rgb, cloud.a * smoothstep(0.45, 0.9, v_swimDepth));
+    }
   } else c *= shadeAll();
-  // Shadows fade out at their rim; deep fish fade out across their widened sides.
-  float alpha = v_color.a * (1.0 - smoothstep(0.1, 1.0, length(v_soft))) * (1.0 - v_blur * smoothstep(0.2, 1.0, abs(v_edge)));
+  // Shadows fade out at their rim. A deep fish is out of focus: from a little
+  // inside its true outline to the blur's reach outside it, it fades out (by
+  // the distance to the outline: across the body, past the snout and the
+  // fin's end), as soft all round as a blurred shape; dithering keeps it
+  // pixelated.
+  float alpha = v_color.a * (1.0 - smoothstep(0.1, 1.0, length(v_soft)));
+  if (v_halo > 0.0) {
+    float out_ = max(abs(v_body.y) - v_body.z, max(v_body.x - 1.6, -1.75 - v_body.x));
+    alpha *= 1.0 - smoothstep(-0.6 * v_halo, v_halo, out_);
+  }
   o = vec4(c * alpha, alpha);
 }
 `
@@ -434,6 +509,12 @@ const vec2 Q[6] = vec2[6](
 );
 const int SEG = ${RING_SEGMENTS};
 uniform float u_radius;
+// A species whose range is a gene (midges): the radius from u_rangeTex's red
+// channel per boid; one with modes: only the living (aux.y 0 flying, 2 perched).
+uniform highp sampler2D u_rangeTex;
+uniform int u_rangeFromTex;
+uniform int u_rangeStride; // texels per boid in u_rangeTex (the genes: BoidKernel geneTexels)
+uniform int u_aliveCheck;
 uniform int u_rings;
 uniform float u_band;      // ring band half-width, world px
 uniform float u_halfSpan;  // half the FOV arc, radians (slightly padded)
@@ -441,6 +522,10 @@ uniform float u_sepRatio;
 out vec2 v_local; // boid frame: x = forward, y = right, unit = radius
 void main() {
   vec4 s = boidState();
+  ivec2 rc = coordOf(boidId());
+  float RR = max(u_rangeFromTex == 1 ? texelFetch(u_rangeTex, ivec2(rc.x * u_rangeStride, rc.y), 0).r : u_radius, 0.0);
+  float mode = boidAux().y;
+  if (u_aliveCheck == 1 && mode != 0.0 && mode != 2.0) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); v_local = vec2(0.0); return; }
   vec2 f, r; float m;
   basisFrom(s.zw, f, r, m);
   vec2 corner; // world-aligned offset, unit = radius
@@ -454,13 +539,13 @@ void main() {
     vec2 q = Q[v - seg * 6]; // x: along the segment, y: across the band
     float segAngle = 2.0 * u_halfSpan / float(SEG);
     float a = -u_halfSpan + (float(seg) + q.x * 0.5 + 0.5) * segAngle;
-    float R = (ring == 0 ? 1.0 : u_sepRatio) * u_radius;
+    float R = (ring == 0 ? 1.0 : u_sepRatio) * RR;
     // The outer edge is pushed out so the straight chord still covers the arc.
     float rad = q.y < 0.0 ? max(R - 2.0 * u_band, 0.0) : (R + u_band) / cos(segAngle * 0.5);
-    v_local = vec2(cos(a), sin(a)) * rad / u_radius;
+    v_local = vec2(cos(a), sin(a)) * rad / RR;
     corner = f * v_local.x + r * v_local.y;
   }
-  gl_Position = toClip(s.xy + corner * u_radius);
+  gl_Position = toClip(s.xy + corner * RR);
 }
 `
 
@@ -484,7 +569,7 @@ void main() {
   if (inFov <= 0.0) discard;
 
   float outer = 1.0 - smoothstep(1.0 - aa, 1.0 + aa, d);
-  float rim = smoothstep(1.0 - aa * 2.5, 1.0 - aa * 0.5, d) * outer;
+  float rim = smoothstep(1.0 - aa * 1.5, 1.0 - aa * 0.3, d) * outer; // a thin line, as the insects' range rings
   float sepRing = 1.0 - smoothstep(0.0, aa, abs(d - u_sepRatio));
 
   float a = inFov * (u_fill * outer + u_rim * rim + u_rim * 0.5 * sepRing);
@@ -493,7 +578,8 @@ void main() {
 }
 `
 
-// Fullscreen background layer for painted regions (influence field).
+// Fullscreen triangle for the screen-space passes (water, shadows, post...), with
+// uv over a world extent (u_uvScale, u_uvOffset).
 export const fieldVS = /* glsl */ `#version 300 es
 uniform vec2 u_uvScale; // world size / (field cells * cell size)
 uniform vec2 u_uvOffset;
@@ -502,17 +588,6 @@ void main() {
   vec2 p = vec2(float((gl_VertexID & 1) << 2) - 1.0, float((gl_VertexID & 2) << 1) - 1.0);
   v_uv = vec2(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5) * u_uvScale + u_uvOffset;
   gl_Position = vec4(p, 0.0, 1.0);
-}
-`
-
-export const fieldFS = /* glsl */ `#version 300 es
-precision mediump float;
-in vec2 v_uv;
-uniform sampler2D u_field;
-out vec4 o;
-void main() {
-  vec4 c = texture(u_field, v_uv);
-  o = vec4(c.rgb * c.a, c.a);
 }
 `
 
@@ -563,6 +638,13 @@ uniform vec2 u_seedOffset; // per-map noise offset
 uniform float u_litter;    // floor details, 0 = none: leaf litter,
 uniform float u_stones;    // pebbles,
 uniform float u_twigs;     // sunken twigs
+uniform vec3 u_sun;        // unit vector towards the sun
+uniform vec2 u_light;      // shadow offset per px of height, away from the sun
+uniform sampler2D u_tint;  // the plants' colour regions: r brown, g yellow
+uniform float u_waterTint; // 0 blue-green .. 1 muddy brown water
+uniform highp sampler2D u_trunks; // baked trunk map (MapTextures): g = distance to the nearest trunk side
+uniform float u_tintCell;
+uniform vec2 u_tintDims;
 out vec4 o;
 ${NOISE}
 ${TUNE}
@@ -577,86 +659,112 @@ float ihash(vec2 cell) {
   return float(h) / 4294967296.0;
 }
 
-// Sludge on the floor: mats of decaying weed and algae in patches across
-// the shallow-to-middle depths, built like the scum mats: overlapping rounded
-// clumps on a jittered grid, lighter in the middle, dense inside a patch and
-// thinning raggedly towards its edge. Olive, dark green and rotting brown.
-const float SLUDGE_CELL = 4.0; // px between clumps
+vec2 sunDir() { return normalize(u_sun.xy + vec2(1e-4, 0.0)); } // along the floor, towards the sun
+
+// Sludge on the floor: a slimy mat of algae and decaying weed in patches
+// across the shallow-to-middle depths, laid out in strands along a slow
+// current (one direction per map, bent by a broad warp), so it reads as
+// streaky and combed rather than clumped. Inside a patch the strands merge
+// into a mat; towards its edge only the thickest strands carry on, trailing
+// off along the current. Colour wanders between olive, dark green, rotting
+// brown and yellowish slime, regionally and strand by strand; thicker mat is
+// darker, strand crests lighter, and the thin fringe lets the floor show
+// through. Baked with the background (no cost per frame).
+float sludgeZone(float depth) { return smoothstep(0.06, 0.18, depth) * (1.0 - smoothstep(0.45, 0.75, depth)); }
+// Patches: broad warped noise at p (world + seed); sludge where it is above the level.
+float sludgePatches(vec2 p) { return fbm(p * 0.0045 + vec2(fbm(p * 0.011 + 3.1), fbm(p * 0.011 + 8.7)) * 0.9); }
+float sludgeLevel(float zone) { return mix(0.78, 0.38, SLUDGE) + (1.0 - zone) * 0.25; }
 vec4 sludge(vec2 world, float depth) {
-  float zone = smoothstep(0.06, 0.18, depth) * (1.0 - smoothstep(0.45, 0.75, depth));
+  float zone = sludgeZone(depth);
   if (zone <= 0.0 || SLUDGE <= 0.0) return vec4(0.0);
-  vec2 seed = u_seedOffset;
-  ivec2 base = ivec2(floor(world / SLUDGE_CELL));
-  vec4 col = vec4(0.0);
-  for (int j = -1; j <= 1; j++) {
-    for (int i = -1; i <= 1; i++) {
-      vec2 c = vec2(base + ivec2(i, j));
-      vec2 h = vec2(ihash(c + seed), ihash(c + seed + 71.0));
-      vec2 centre = (c + 0.1 + 0.8 * h) * SLUDGE_CELL;
-      vec2 p = centre + seed;
-      // Patches: broad warped noise cut at a level set by the amount; a clump
-      // grows here with the patch's density, so edges thin out clump by clump.
-      float patches = fbm(p * 0.0045 + vec2(fbm(p * 0.011 + 3.1), fbm(p * 0.011 + 8.7)) * 0.9);
-      float level = mix(0.78, 0.38, SLUDGE) + (1.0 - zone) * 0.25;
-      float density = smoothstep(level - 0.01, level + 0.03, patches);
-      if (ihash(c + seed + 13.0) >= density) continue;
-      float r = (2.2 + 1.4 * ihash(c + seed + 29.0)) * (0.6 + 0.4 * density);
-      float dist = length(world - centre);
-      if (dist >= r) continue;
-      // Regional mix of olive and dark green, with rotting brown here and there.
-      float v = ihash(c + seed + 47.0);
-      vec3 clump = mix(vec3(0.17, 0.19, 0.08), vec3(0.27, 0.29, 0.11), smoothstep(0.3, 0.7, fbm(p * 0.008 + 20.0)));
-      clump = mix(clump, vec3(0.26, 0.19, 0.09), smoothstep(0.55, 0.75, fbm(p * 0.015 + 70.0)) * 0.85);
-      clump *= 0.85 + 0.3 * v;                                        // per-clump shade
-      clump = mix(clump, vec3(0.35, 0.37, 0.15), step(0.92, v) * 0.6); // a few fresh tufts
-      col = vec4(clump * (1.08 - 0.25 * dist / r), 1.0);               // lighter middle
-    }
-  }
-  return col;
+  vec2 p = world + u_seedOffset;
+  float level = sludgeLevel(zone);
+  float patches = sludgePatches(p);
+  if (patches < level - 0.09) return vec4(0.0);
+  // Along the current: a direction per map, bent by a broad warp.
+  float a = 6.2832 * fract(u_seedOffset.x * 0.0137 + u_seedOffset.y * 0.0071);
+  vec2 dir = vec2(cos(a), sin(a));
+  vec2 bent = p + (vec2(fbm(p * 0.004 + 11.0), fbm(p * 0.004 + 29.0)) - 0.5) * 160.0;
+  vec2 q = vec2(dot(bent, dir), dot(bent, vec2(-dir.y, dir.x)));
+  float strands = fbm(vec2(q.x * 0.025, q.y * 0.28));      // long along the current, thin across
+  float fibres = vnoise(vec2(q.x * 0.07, q.y * 1.1));      // finer combing
+  float body = smoothstep(level - 0.08, level + 0.06, patches);
+  float mat = body * 0.75 + (strands - 0.5) * 1.1 + (fibres - 0.5) * 0.3;
+  if (mat < 0.32) return vec4(0.0);
+  // Colour: regional, then strand by strand.
+  float tone = fbm(p * 0.009 + 20.0);
+  vec3 c = mix(vec3(0.17, 0.21, 0.08), vec3(0.28, 0.30, 0.11), smoothstep(0.3, 0.7, tone)); // dark green .. olive
+  c = mix(c, vec3(0.27, 0.20, 0.10), smoothstep(0.55, 0.75, fbm(p * 0.014 + 70.0)) * 0.8); // rotting brown
+  c = mix(c, vec3(0.37, 0.38, 0.15), smoothstep(0.62, 0.8, fbm(vec2(q.x * 0.012, q.y * 0.09) + 5.0)) * 0.7); // yellowish slime
+  c *= 0.8 + 0.4 * strands;                         // strand crests lighter
+  c *= 1.0 - 0.18 * smoothstep(0.6, 1.1, mat);      // thick mat darker
+  c *= 0.92 + 0.16 * fibres;
+  float alpha = smoothstep(0.32, 0.5, mat) * 0.6 + 0.4 * step(0.4, mat); // thin fringe lets the floor through
+  return vec4(c, alpha);
 }
 
 // Floor details. Like the sludge they live in the cached background, so they
-// cost nothing per frame: each is a jittered grid of shapes, one per cell at
-// most, found by checking the 3x3 cells around the pixel; whether a cell has
-// one is decided per cell (by value noise at the cell), so shapes are whole.
+// cost nothing per frame (redrawn only when the map, the sun or their amounts
+// change): each is a jittered grid of shapes, one per cell at most, found by
+// checking the 3x3 cells around the pixel; whether a cell has one is decided
+// per cell, so shapes are whole. Sized and coloured like the plants, scum and
+// pads above them (crisp shapes a few px across, the marsh palette), they
+// gather in drifts and beds, are lit from the sun's side and cast a small
+// shadow away from it (u_light) onto the floor.
 
-// Leaf litter: fallen leaves, thickest near the banks the trees and shrubs
-// drop them from and in drifts, thinning into the deep water. Brown, ochre,
-// rust and the grey-brown of old leaves, each with a darker midrib.
-const float LEAF_CELL = 5.0;
+// Leaf litter: fallen leaves, pointed at both ends with a stalk, thickest near
+// the banks the trees and shrubs drop them from and gathered in drifts,
+// thinning into the deep water. Ochre, brown, olive-tan, a little rust and the
+// grey-brown of old leaves; a darker midrib, the half facing the sun lighter
+// (they lie a little curled).
+const float LEAF_CELL = 8.0;
 vec4 litter(vec2 world, float depth, float shore) {
   float zone = (1.0 - smoothstep(0.3, 0.8, depth)) * mix(0.35, 1.0, shore);
   if (u_litter <= 0.0 || zone <= 0.0) return vec4(0.0);
   vec2 seed = u_seedOffset + 311.0;
   ivec2 base = ivec2(floor(world / LEAF_CELL));
   vec4 col = vec4(0.0);
+  float order = -1.0;
   for (int j = -1; j <= 1; j++) {
     for (int i = -1; i <= 1; i++) {
       vec2 c = vec2(base + ivec2(i, j));
       vec2 centre = (c + 0.1 + 0.8 * vec2(ihash(c + seed), ihash(c + seed + 71.0))) * LEAF_CELL;
-      float drift = smoothstep(0.3, 0.7, vnoise((centre + seed) * 0.012));
-      if (ihash(c + seed + 5.0) >= u_litter * zone * (0.25 + 0.75 * drift)) continue;
+      float drift = smoothstep(0.42, 0.62, fbm((centre + seed) * 0.009));
+      if (ihash(c + seed + 5.0) >= u_litter * zone * (0.12 + 1.1 * drift)) continue;
       float a = ihash(c + seed + 11.0) * 6.2832;
-      vec2 q = mat2(cos(a), -sin(a), sin(a), cos(a)) * (world - centre);
-      float len = 1.8 + 1.8 * ihash(c + seed + 17.0);
-      float wid = len * (0.4 + 0.25 * ihash(c + seed + 23.0));
-      if ((q.x * q.x) / (len * len) + (q.y * q.y) / (wid * wid) >= 1.0) continue;
+      float ca = cos(a), sa = sin(a);
+      vec2 q = mat2(ca, -sa, sa, ca) * (world - centre);
+      float len = 2.6 + 2.0 * ihash(c + seed + 17.0); // half length
+      float wid = len * (0.38 + 0.18 * ihash(c + seed + 23.0));
+      float x = q.x / len;
+      float half_ = wid * (1.0 - x * x);
+      bool blade = abs(x) < 1.0 && abs(q.y) < half_;
+      bool stalk = q.x >= len - 0.3 && q.x < len + 1.3 && abs(q.y) < 0.5;
+      if (!blade && !stalk) continue;
+      float top = ihash(c + seed + 41.0); // which overlapping leaf lies on top
+      if (top < order) continue;
+      order = top;
       float v = ihash(c + seed + 29.0);
-      vec3 leaf = v < 0.35 ? vec3(0.36, 0.24, 0.12) : v < 0.6 ? vec3(0.45, 0.34, 0.15) : v < 0.8 ? vec3(0.42, 0.2, 0.1) : vec3(0.3, 0.27, 0.21);
-      leaf *= 0.85 + 0.3 * ihash(c + seed + 37.0);
-      if (abs(q.y) < 0.35) leaf *= 0.75; // midrib
+      vec3 leaf = v < 0.3 ? vec3(0.47, 0.38, 0.22) : v < 0.55 ? vec3(0.38, 0.28, 0.16) : v < 0.75 ? vec3(0.42, 0.40, 0.24) : v < 0.88 ? vec3(0.50, 0.30, 0.15) : vec3(0.33, 0.31, 0.24);
+      leaf *= 0.88 + 0.24 * ihash(c + seed + 37.0);
+      if (blade) {
+        leaf *= 1.0 + 0.14 * sign(q.y) * dot(vec2(-sa, ca), sunDir()); // curled: one half to the sun
+        if (abs(q.y) < 0.45) leaf *= 0.78;                               // midrib
+        else if (abs(q.y) > half_ - 0.6) leaf *= 0.88;                   // darker rim
+      } else leaf *= 0.7;
       col = vec4(leaf, 1.0);
     }
   }
   return col;
 }
 
-// Pebbles: beds of small pebbles in the shallows, lit from one side,
-// greening with algae the deeper they lie.
-const float PEBBLE_CELL = 4.0;
-vec3 stoneColour(float v, float depth) {
-  vec3 c = mix(vec3(0.36, 0.34, 0.3), vec3(0.3, 0.26, 0.2), v);
-  return mix(c, vec3(0.22, 0.27, 0.15), smoothstep(0.15, 0.6, depth) * 0.7);
+// Pebbles: beds of rounded stones in the shallows, lit from the sun's side
+// with a darker rim and a wet glint, greening with algae the deeper they lie.
+const float PEBBLE_CELL = 6.0;
+vec3 stoneColour(float v, float w, float depth) {
+  vec3 c = mix(vec3(0.50, 0.48, 0.43), vec3(0.45, 0.39, 0.30), v);
+  c = mix(c, vec3(0.33, 0.31, 0.28), step(0.8, w)); // a few dark ones
+  return mix(c, vec3(0.26, 0.31, 0.17), smoothstep(0.12, 0.55, depth) * 0.7);
 }
 vec4 stones(vec2 world, float depth) {
   if (u_stones <= 0.0) return vec4(0.0);
@@ -669,24 +777,34 @@ vec4 stones(vec2 world, float depth) {
     for (int i = -1; i <= 1; i++) {
       vec2 c = vec2(base + ivec2(i, j));
       vec2 centre = (c + 0.15 + 0.7 * vec2(ihash(c + seed + 41.0), ihash(c + seed + 43.0))) * PEBBLE_CELL;
-      float bed = smoothstep(0.45, 0.65, vnoise((centre + seed) * 0.02));
-      if (ihash(c + seed + 47.0) >= u_stones * zone * bed) continue;
-      float r = 0.8 + 1.1 * ihash(c + seed + 53.0);
-      vec2 p = world - centre;
-      if (dot(p, p) >= r * r) continue;
-      float lit = 0.85 + 0.3 * dot(p / r, vec2(-0.6, -0.6));
-      col = vec4(stoneColour(ihash(c + seed + 59.0), depth) * lit, 1.0);
+      float bed = smoothstep(0.42, 0.62, vnoise((centre + seed) * 0.018));
+      if (ihash(c + seed + 47.0) >= u_stones * zone * bed * 1.3) continue;
+      float r = 1.3 + 1.5 * ihash(c + seed + 53.0);
+      float a = ihash(c + seed + 61.0) * 3.1416;
+      float ca = cos(a), sa = sin(a);
+      vec2 q = mat2(ca, -sa, sa, ca) * (world - centre);
+      vec2 n2 = q / (r * vec2(1.0, 0.7 + 0.3 * ihash(c + seed + 67.0)));
+      float rr = dot(n2, n2);
+      if (rr >= 1.0) continue;
+      n2 = transpose(mat2(ca, -sa, sa, ca)) * n2; // back to world directions
+      vec3 n = vec3(n2, sqrt(1.0 - rr));
+      float sun = max(dot(n, u_sun), 0.0);
+      vec3 stone = stoneColour(ihash(c + seed + 59.0), ihash(c + seed + 73.0), depth);
+      stone *= (0.55 + 0.6 * sun) * mix(1.0, 0.78, smoothstep(0.6, 1.0, rr));
+      stone += vec3(0.08) * step(0.97, sun); // wet glint
+      col = vec4(stone, 1.0);
     }
   }
   return col;
 }
 
-// Sunken twigs: dark waterlogged sticks, some with a side branch, more near
-// the banks.
-const float TWIG_CELL = 26.0;
-float segment(vec2 p, vec2 a, vec2 b) {
+// Sunken twigs: waterlogged sticks with a slight bend, some with a side
+// branch, more near the banks; bark-brown to grey, lighter along the side
+// facing the sun.
+const float TWIG_CELL = 30.0;
+vec2 closest(vec2 p, vec2 a, vec2 b) {
   vec2 ab = b - a;
-  return length(p - a - ab * clamp(dot(p - a, ab) / dot(ab, ab), 0.0, 1.0));
+  return a + ab * clamp(dot(p - a, ab) / dot(ab, ab), 0.0, 1.0);
 }
 vec4 twigs(vec2 world, float depth, float shore) {
   float zone = (1.0 - smoothstep(0.4, 0.9, depth)) * mix(0.3, 1.0, shore);
@@ -700,25 +818,77 @@ vec4 twigs(vec2 world, float depth, float shore) {
       vec2 centre = (c + 0.1 + 0.8 * vec2(ihash(c + seed), ihash(c + seed + 71.0))) * TWIG_CELL;
       float a = ihash(c + seed + 7.0) * 6.2832;
       vec2 dir = vec2(cos(a), sin(a));
-      float half_ = 4.0 + 7.0 * ihash(c + seed + 11.0);
+      vec2 perp = vec2(-dir.y, dir.x);
+      float half_ = 6.0 + 7.0 * ihash(c + seed + 11.0);
       vec2 p0 = centre - dir * half_;
       vec2 p1 = centre + dir * half_;
-      float w = 0.5 + 0.35 * ihash(c + seed + 13.0);
-      float d = segment(world, p0, p1);
+      vec2 mid = centre + perp * (ihash(c + seed + 31.0) - 0.5) * 5.0; // the bend
+      float w = 0.8 + 0.5 * ihash(c + seed + 13.0);
+      vec2 near = closest(world, p0, mid);
+      vec2 near1 = closest(world, mid, p1);
+      if (distance(world, near1) < distance(world, near)) near = near1;
       if (ihash(c + seed + 17.0) < 0.6) {
-        // A side branch from partway along.
+        // A side branch from partway along, thinner.
         float t = 0.3 + 0.4 * ihash(c + seed + 19.0);
-        float b = a + (ihash(c + seed + 23.0) < 0.5 ? 0.6 : -0.6);
-        vec2 s0 = mix(p0, p1, t);
-        d = min(d, segment(world, s0, s0 + vec2(cos(b), sin(b)) * half_ * 0.6) + 0.15);
+        float b = a + (ihash(c + seed + 23.0) < 0.5 ? 0.7 : -0.7);
+        vec2 s0 = t < 0.5 ? mix(p0, mid, t * 2.0) : mix(mid, p1, t * 2.0 - 1.0);
+        vec2 nb = closest(world, s0, s0 + vec2(cos(b), sin(b)) * half_ * 0.55);
+        if (distance(world, nb) + 0.25 < distance(world, near)) near = nb;
       }
+      vec2 off = world - near;
+      float d = length(off);
       if (d >= w) continue;
-      vec3 wood = mix(vec3(0.15, 0.1, 0.06), vec3(0.24, 0.18, 0.11), ihash(c + seed + 29.0));
-      return vec4(wood * (d < w * 0.4 ? 1.15 : 1.0), 1.0);
+      float v = ihash(c + seed + 29.0);
+      vec3 wood = mix(vec3(0.27, 0.20, 0.13), vec3(0.36, 0.29, 0.19), v);
+      wood = mix(wood, vec3(0.34, 0.32, 0.27), step(0.8, ihash(c + seed + 37.0))); // bleached
+      if (d > w * 0.35) wood *= 1.0 + 0.2 * sign(dot(off, sunDir()));              // round, lit from one side
+      return vec4(wood, 1.0);
     }
   }
   return vec4(0.0);
 }
+
+// The bare floor: a mucky film of silt and rot, mottled green-grey, grey and
+// brown at two scales, with fine fibres and bits of stick in it. It thickens
+// and darkens towards the sludge patches (the same patch noise, below their
+// level), so a patch's edge fades into the floor around it instead of
+// stopping dead. Returns the colour and how much it covers.
+const float FIBRE_CELL = 6.0;
+vec4 floorMuck(vec2 world, float depth) {
+  vec2 seed = u_seedOffset + 997.0;
+  vec2 p = world + u_seedOffset;
+  float broad = fbm((world + seed) * 0.012);
+  float fine = fbm((world + seed) * 0.08 + 4.0);
+  vec3 muck = mix(vec3(0.25, 0.27, 0.19), vec3(0.27, 0.22, 0.14), smoothstep(0.35, 0.65, broad)); // green-grey .. brown
+  muck = mix(muck, vec3(0.24, 0.24, 0.21), smoothstep(0.5, 0.75, fine) * 0.6);                    // grey silt
+  muck *= 0.8 + 0.4 * fine;
+  // Towards the sludge: thicker, darker olive.
+  float zone = sludgeZone(depth);
+  float halo = SLUDGE > 0.0 ? smoothstep(sludgeLevel(zone) - 0.14, sludgeLevel(zone) + 0.02, sludgePatches(p)) * zone : 0.0;
+  muck = mix(muck, vec3(0.18, 0.20, 0.09), halo * 0.6);
+  float cover = (0.45 + 0.3 * broad + 0.3 * halo) * (1.0 - mix(1.0, 0.5, u_waterTint) * smoothstep(0.55, 0.95, depth)); // thinner in the deep (gone in clear blue-green water)
+  // Fibres and bits of stick: short dark strokes, one per cell at most.
+  ivec2 base = ivec2(floor(world / FIBRE_CELL));
+  for (int j = -1; j <= 1; j++) {
+    for (int i = -1; i <= 1; i++) {
+      vec2 c = vec2(base + ivec2(i, j));
+      if (ihash(c + seed + 3.0) >= 0.4 + 0.35 * halo) continue;
+      vec2 centre = (c + 0.1 + 0.8 * vec2(ihash(c + seed), ihash(c + seed + 71.0))) * FIBRE_CELL;
+      float a = ihash(c + seed + 7.0) * 6.2832;
+      vec2 dir = vec2(cos(a), sin(a));
+      float half_ = 1.0 + 2.2 * ihash(c + seed + 11.0);
+      if (distance(world, closest(world, centre - dir * half_, centre + dir * half_)) >= 0.75) continue;
+      muck = mix(vec3(0.17, 0.13, 0.08), vec3(0.26, 0.21, 0.13), ihash(c + seed + 13.0));
+      cover = max(cover, 0.85 * (1.0 - smoothstep(0.55, 0.95, depth)));
+    }
+  }
+  return vec4(muck, cover);
+}
+
+// Heights (px) the details stand off the floor, for their shadows.
+const float LEAF_H = 0.6;
+const float STONE_H = 1.6;
+const float TWIG_H = 1.2;
 
 void main() {
   vec2 world = v_uv * u_view + u_viewOffset;
@@ -726,29 +896,50 @@ void main() {
   float d = texture(u_sdf, world / u_sdfExtent).r; // + water, - land
 
   float depth = clamp((u_landLevel - e) / u_landLevel, 0.0, 1.0);
-  // Murky swamp water: olive-brown shallows to dark peaty green.
+  // Murky swamp water: olive-brown shallows, then by u_waterTint from dark
+  // peaty blue-green (0) to a muddy brown (1) in the middle and the deep.
   vec3 shallow = vec3(0.31, 0.32, 0.19);
-  vec3 mid = vec3(0.17, 0.21, 0.14);
-  vec3 deep = vec3(0.06, 0.09, 0.08);
-  vec3 water = depth < 0.5
-    ? mix(shallow, mid, smoothstep(0.0, 0.5, depth))
-    : mix(mid, deep, smoothstep(0.5, 1.0, depth));
+  vec3 mid = mix(vec3(0.17, 0.21, 0.14), vec3(0.21, 0.21, 0.13), u_waterTint);
+  vec3 deep = mix(vec3(0.06, 0.09, 0.08), vec3(0.17, 0.13, 0.08), u_waterTint);
+  float look = depthLook(depth);
+  vec3 water = look < 0.5
+    ? mix(shallow, mid, smoothstep(0.0, 0.5, look))
+    : mix(mid, deep, smoothstep(0.5, 1.0, look));
 
+  // Soil: the tint of the plants growing there (their colour region, as the
+  // plant bases are coloured) or a warm earth brown, in patches; never so
+  // dark that the gaps between plants read as holes.
   float grain = hash(floor(world / 3.0));
-  vec3 land = mix(vec3(0.16, 0.13, 0.09), vec3(0.12, 0.17, 0.09), smoothstep(0.35, 0.7, fbm(world * 0.02)));
-  land *= 0.92 + 0.1 * grain;
-  land = mix(land, vec3(0.10, 0.09, 0.07), 1.0 - smoothstep(-6.0, 0.0, d)); // wet mud
+  vec2 tint = texture(u_tint, (world / u_tintCell + 0.5) / u_tintDims).rg;
+  vec3 region = mix(mix(vec3(0.19, 0.28, 0.11), vec3(0.29, 0.33, 0.13), tint.g), vec3(0.29, 0.23, 0.14), tint.r); // plant base palette
+  vec3 earth = mix(vec3(0.34, 0.27, 0.18), vec3(0.29, 0.23, 0.15), fbm(world * 0.05 + 13.0));
+  vec3 land = mix(region * 1.05, earth, smoothstep(0.4, 0.6, fbm(world * 0.018 + u_seedOffset)));
+  land *= 0.9 + 0.14 * grain;
+  // Beside a trunk the ground is bare and dry (plants make way for it, see
+  // landClearing): a lighter brown of crumbled bark and turned earth, so the
+  // shadows piling up there stay brown instead of turning black.
+  float toTrunk = texelFetch(u_trunks, clamp(ivec2(world), ivec2(0), textureSize(u_trunks, 0) - 1), 0).g;
+  vec3 dry = mix(vec3(0.40, 0.32, 0.21), vec3(0.34, 0.27, 0.18), fbm(world * 0.09 + 5.0));
+  land = mix(land, dry, (1.0 - smoothstep(22.0, 40.0, toTrunk)) * 0.85); // as far as plants make way (a plant's reach)
+  land = mix(land, vec3(0.16, 0.14, 0.10), smoothstep(-6.0, 0.0, d)); // wet mud: the last 6 px before the water
 
   // Things on the floor are seen through the whole water column: the murk a
-  // fish on the bottom gets, and a little more the deeper they lie. Stones,
-  // then leaves and twigs on them, then sludge over everything.
+  // fish on the bottom gets, and a little more the deeper they lie. The mucky
+  // film, stones, then leaves and twigs on them, then sludge over everything.
   float murk = 1.0 - (1.0 - murkAt(depth)) * (1.0 - 0.5 * depth);
   float shore = 1.0 - smoothstep(0.0, 120.0, d);
+  vec4 film = floorMuck(world, depth);
+  water = mix(water, mix(film.rgb, water, murk), film.a);
+  // Each casts a shadow onto what lies below it: shadowed where the shape
+  // covers the point a little towards the sun (by its height).
   vec4 stone = stones(world, depth);
+  if (stone.a == 0.0 && stones(world - u_light * STONE_H, depth).a > 0.0) water *= mix(0.72, 1.0, murk);
   water = mix(water, mix(stone.rgb, water, murk), stone.a);
   vec4 leaf = litter(world, depth, shore);
+  if (leaf.a == 0.0 && litter(world - u_light * LEAF_H, depth, shore).a > 0.0) water *= mix(0.8, 1.0, murk);
   water = mix(water, mix(leaf.rgb, water, murk), leaf.a);
   vec4 twig = twigs(world, depth, shore);
+  if (twig.a == 0.0 && twigs(world - u_light * TWIG_H, depth, shore).a > 0.0) water *= mix(0.75, 1.0, murk); // shadows fade into the murk with what casts them
   water = mix(water, mix(twig.rgb, water, murk), twig.a);
   vec4 muck = sludge(world, depth);
   water = mix(water, mix(muck.rgb, water, murk), muck.a);
@@ -787,6 +978,10 @@ uniform vec2 u_elevDims;
 uniform vec2 u_sdfExtent;
 uniform float u_landLevel;
 uniform vec2 u_seedOffset; // per-map noise offset
+uniform float u_amount;    // how much scum: 0 none, 1 as generated, 2 spreading far over the water
+uniform sampler2D u_plantDensity; // 0..1 how crowded with plants, u_densityCell px cells
+uniform float u_densityCell;
+uniform float u_amongPlants; // scum among plants: 0 none, 1 as generated, 2 crowding into them
 out vec4 o;
 ${NOISE}
 ${SCUM_FROND}
@@ -799,7 +994,10 @@ void main() {
   float e = texture(u_elev, (world / u_elevCell + 0.5) / u_elevDims).r;
   float depth = clamp((u_landLevel - e) / u_landLevel, 0.0, 1.0);
   float shoreBoost = 1.0 - smoothstep(0.0, 40.0, d);
-  float base = (1.0 - depth) * 0.75 + shoreBoost * 0.25 - 0.62;
+  if (u_amount <= 0.0) return;
+  float base = (1.0 - depth) * 0.75 + shoreBoost * 0.25 - 0.62 + (u_amount - 1.0) * 0.22;
+  float plants = texture(u_plantDensity, world / u_densityCell / vec2(textureSize(u_plantDensity, 0))).r;
+  base += (u_amongPlants - 1.0) * plants * 0.6;
   if (base + 0.96 < 0.35) return; // even maximal noise can't make a mat here
 
   vec2 mp = world + u_seedOffset;
@@ -912,8 +1110,8 @@ void main() {
   o = vec4(0.0, 1.0, 0.0, 1.0);
 }
 `
-// Silt stirred up from the floor (SiltField): a brown cloud low in the water,
-// seen through the murk above it. Drawn over the floor, under the fish.
+// Silt stirred up from the floor (SiltField; looks: SILT_LOOK). Drawn over
+// the floor, under the fish (low fish inside a cloud are veiled in boidFS).
 export const siltFS = /* glsl */ `#version 300 es
 precision highp float;
 precision highp sampler2D;
@@ -925,15 +1123,15 @@ uniform vec2 u_view;
 uniform vec2 u_viewOffset;
 out vec4 o;
 ${TUNE}
+${SILT_LOOK}
 void main() {
   vec2 world = v_uv * u_view + u_viewOffset;
   float d = texture(u_silt, world / u_siltExtent).r;
   if (d < 0.03) discard;
   vec4 water = texelFetch(u_background, ivec2(gl_FragCoord.xy), 0);
-  // Fine mud: a dark grey with a little brown, barely tinted by the water.
-  vec3 silt = mix(vec3(0.3, 0.28, 0.24), water.rgb, 0.15);
-  float a = SILT_OPACITY * smoothstep(0.03, 0.7, d);
-  o = vec4(silt * a, a);
+  if (water.a <= 0.0) discard; // land
+  vec4 cloud = siltLook(d, water.rgb, water.a);
+  o = vec4(cloud.rgb * cloud.a, cloud.a);
 }
 `
 export const scumCompositeFS = /* glsl */ `#version 300 es
@@ -945,6 +1143,140 @@ void main() {
   vec4 c = texelFetch(u_scumLayer, ivec2(gl_FragCoord.xy), 0);
   if (c.a < 0.5) discard;
   o = vec4(c.rgb * shade(), 1.0);
+}
+`
+
+// Trunk colours, baked once per trunk layout (gpu/MapTextures.js) into a
+// world-space texture, one texel per px: the colour of the highest trunk
+// surface there (a = 1), before light and shade. Per trunk (its seed): a
+// colour roll from dark brown through grey-tan and silver to pale, and some
+// are birch-like, chalky white with dark dashes across the grain and dark
+// patches. Along the grain: streaks, checks, remnant bark and moss. Close to
+// the water (by how high that surface is above it): lichen crusts (pale
+// grey-green, some yellow-orange) higher up, and slimy green algae at and
+// below the waterline. Drawn per frame (logFS) with one texture read.
+export const trunkLookFS = /* glsl */ `#version 300 es
+precision highp float;
+precision highp sampler2D;
+${NOISE}
+${LOGS}
+out vec4 o;
+vec3 trunkColour(int i, vec4 sec) {
+  vec4 look = logLook(i);
+  float seed = look.x;
+  float s = sec.y;
+  float along = sec.x * look.y + look.w; // distance along the whole trunk
+  float roll = hash(vec2(seed * 91.7, 3.1));
+  bool birch = hash(vec2(seed * 53.3, 7.7)) < 0.28;
+  vec3 base = roll < 0.3 ? mix(vec3(0.40, 0.30, 0.20), vec3(0.50, 0.40, 0.29), roll / 0.3)            // browner
+    : roll < 0.7 ? mix(vec3(0.56, 0.51, 0.43), vec3(0.66, 0.64, 0.58), (roll - 0.3) / 0.4)              // grey-tan .. silver
+    : mix(vec3(0.70, 0.67, 0.60), vec3(0.78, 0.75, 0.68), (roll - 0.7) / 0.3);                          // pale
+  if (birch) base = mix(vec3(0.84, 0.82, 0.76), vec3(0.78, 0.76, 0.70), roll);
+  vec3 wood = base * (0.86 + 0.24 * vnoise(vec2(along * 0.05, s * 6.0 + seed * 9.0))); // long grain streaks
+  float check = abs(vnoise(vec2(along * 0.08, s * 9.0 + seed * 5.0)) - 0.5);
+  wood *= 1.0 - (birch ? 0.15 : 0.38) * step(check, 0.035);                               // checks along the grain
+  if (birch) {
+    // Dark dashes across the grain (short along it), and dark patches.
+    float dash = vnoise(vec2(along * 0.8, s * 1.3 + seed * 13.0));
+    wood = mix(wood, vec3(0.20, 0.19, 0.17), step(0.68, dash) * 0.9);
+    float patch_ = fbm(vec2(along * 0.07, s * 0.9) + seed * 31.0);
+    wood = mix(wood, vec3(0.16, 0.15, 0.14), smoothstep(0.66, 0.7, patch_) * 0.85);
+    wood = mix(wood, vec3(0.80, 0.66, 0.52), smoothstep(0.7, 0.74, fbm(vec2(along * 0.05, s) + seed * 17.0)) * 0.5); // peeling, warmer
+  } else {
+    float bark = smoothstep(0.6, 0.7, fbm(vec2(along * 0.04, s * 1.2) + seed * 23.0));
+    wood = mix(wood, base * 0.48, bark * 0.85);                                           // remnant bark
+  }
+  // Close to the water: how high this surface is above it (px; < 0 under).
+  float above = (logTop(sec) - LOG_LAND) / LOG_ELEV_PER_PX;
+  float damp = 1.0 - smoothstep(2.0, 24.0, above);
+  float moss = smoothstep(0.58, 0.75, fbm(vec2(along * 0.03, s) + seed * 41.0)) * (1.0 - abs(s));
+  wood = mix(wood, vec3(0.34, 0.42, 0.18), moss * mix(0.45, 0.85, damp));
+  // Lichen: crusty spots, mostly on the upper side, where it is damp but dry enough.
+  float lichenZone = (0.45 + 0.55 * (1.0 - smoothstep(4.0, 40.0, above))) * smoothstep(-1.0, 1.5, above) * (1.0 - 0.5 * s * s);
+  // Small crusts (a few px), in colonies that are thicker where it is damper.
+  float spot = vnoise(vec2(along * 0.7, s * 7.0) + seed * 7.0);
+  float colony = smoothstep(0.35, 0.6, fbm(vec2(along * 0.05, s * 0.7) + seed * 29.0));
+  float kind = vnoise(vec2(along * 0.09, s * 1.2) + seed * 19.0);
+  vec3 lichen = kind > 0.72 ? vec3(0.74, 0.56, 0.22) : kind < 0.3 ? vec3(0.44, 0.52, 0.36) : vec3(0.58, 0.64, 0.46);
+  float crust = step(0.76 - 0.14 * lichenZone, spot) * colony * step(0.05, lichenZone);
+  wood = mix(wood, lichen * (0.9 + 0.2 * hash(floor(vec2(along, s * 8.0)))), crust * 0.85);
+  // Algae: slimy green at the waterline and below, in patches, darker lower down.
+  float wet = 1.0 - smoothstep(0.0, 6.0, above);
+  float slime = smoothstep(0.4, 0.55, fbm(vec2(along * 0.06, s * 1.5) + seed * 61.0) + wet * 0.25);
+  vec3 algae = mix(vec3(0.26, 0.36, 0.13), vec3(0.17, 0.25, 0.10), smoothstep(0.0, -6.0, above));
+  wood = mix(wood, algae, wet * slime * 0.9);
+  return wood;
+}
+// Shelf fungi (brackets): on about 60% of the trunks, on dry stretches (4+ px
+// above the water), now and then a cluster of 1-3 half-discs grows out from a
+// side, overlapping, each cluster one colour (orange, white, tan or brown)
+// with growth rings, darker at the base and a pale fresh rim. In the bake's
+// alpha 0.5 (wood is 1): logFS draws them past the trunk's outline too.
+const float BRACKET_STRETCH = 16.0; // px of trunk per possible cluster
+vec4 bracketAt(int i, vec4 sec) {
+  vec4 look = logLook(i);
+  float seed = look.x;
+  if (sec.x < 0.0 || sec.x > 1.0 || hash(vec2(seed * 37.1, 2.9)) < 0.4) return vec4(0.0);
+  float above = (sec.z - LOG_LAND) / LOG_ELEV_PER_PX; // axis height above the water (px)
+  if (above < 4.0) return vec4(0.0);
+  float r = sec.w / LOG_ELEV_PER_PX;
+  float along = sec.x * look.y + look.w;
+  float side = sec.y < 0.0 ? -1.0 : 1.0;
+  float out_ = abs(sec.y) * r - r; // px beyond the side
+  if (out_ > 6.0 || out_ < -1.0) return vec4(0.0);
+  float cell = floor(along / BRACKET_STRETCH);
+  vec4 found = vec4(0.0);
+  for (int k = -1; k <= 1; k++) {
+    float c = cell + float(k);
+    vec2 h = vec2(seed * 113.0 + c * 1.7, side * 3.3 + seed * 7.0);
+    if (hash(h) > 0.25 + 0.15 * smoothstep(4.0, 25.0, above)) continue; // now and then: drier, a little more often
+    float pick = hash(h + 5.1);
+    vec3 col = pick < 0.3 ? vec3(0.86, 0.50, 0.18) : pick < 0.55 ? vec3(0.88, 0.85, 0.77) : pick < 0.8 ? vec3(0.72, 0.60, 0.42) : vec3(0.46, 0.31, 0.18);
+    float n = 1.0 + floor(hash(h + 9.7) * 3.0);
+    for (int m = 0; m < 3; m++) {
+      if (float(m) >= n) break;
+      float R = 3.0 + 3.0 * hash(h + float(m) * 2.3 + 1.1);
+      float u = along - (c + 0.2 + 0.6 * hash(h + float(m) * 4.1 + 0.7)) * BRACKET_STRETCH;
+      float v = out_ + 1.0; // rooted a little inside the outline
+      if (v < 0.0) continue;
+      float e = (u * u) / (R * R * 1.2) + (v * v) / (R * R * 0.75); // wider along the trunk than out
+      if (e >= 1.0) continue;
+      float d = sqrt(e);
+      vec3 cc = col * (0.9 + 0.12 * step(0.5, fract(d * (1.5 + R * 0.35))));  // growth rings
+      cc *= mix(0.7, 1.0, smoothstep(0.0, 0.5, d));                           // darker at the base
+      cc = mix(cc, vec3(0.93, 0.89, 0.80), smoothstep(0.78, 0.95, d) * 0.45); // pale fresh rim
+      found = vec4(cc, 0.5);
+    }
+  }
+  return found;
+}
+
+void main() {
+  vec2 p = gl_FragCoord.xy;
+  // Brackets first: they sit on the trunk's edge and out past it.
+  for (int i = 0; i < u_logCount; i++) {
+    vec4 e = logEnds(i);
+    vec4 sz = logSize(i);
+    float r = max(sz.x, sz.y) + 8.0;
+    if (p.x < min(e.x, e.z) - r || p.x > max(e.x, e.z) + r || p.y < min(e.y, e.w) - r || p.y > max(e.y, e.w) + r) continue;
+    vec4 b = bracketAt(i, logSection(i, p));
+    if (b.a > 0.0) { o = b; return; }
+  }
+  float top = -1.0;
+  int best = -1;
+  vec4 bestSec = vec4(0.0);
+  for (int i = 0; i < u_logCount; i++) {
+    vec4 e = logEnds(i);
+    vec4 sz = logSize(i);
+    float r = max(sz.x, sz.y) + 1.0;
+    if (p.x < min(e.x, e.z) - r || p.x > max(e.x, e.z) + r || p.y < min(e.y, e.w) - r || p.y > max(e.y, e.w) + r) continue;
+    vec4 sec = logSection(i, p);
+    if (abs(sec.y) > 1.0 || !logCovers(i, vec4(sec.x, 0.0, sec.zw))) continue;
+    float t = logTop(sec);
+    if (t > top) { top = t; best = i; bestSec = sec; }
+  }
+  if (best < 0) { o = vec4(0.0); return; }
+  o = vec4(trunkColour(best, bestSec), 1.0);
 }
 `
 
@@ -983,7 +1315,7 @@ void main() {
   float len = length(ab);
   vec2 dir = ab / len;
   vec2 q = Q[gl_VertexID];
-  float rMax = max(sz.x, sz.y) + 2.0;
+  float rMax = max(sz.x, sz.y) + 8.0; // room for round joints and shelf fungi
   float along = mix(-rMax, len + rMax, q.x); // room for round joints
   vec2 p = e.xy + dir * along + vec2(-dir.y, dir.x) * q.y * rMax;
   v_world = p;
@@ -1003,12 +1335,21 @@ flat in int v_seg;
 uniform int u_pass;          // 0 submerged, 1 above water, 2 shadow of the part above water
 uniform vec3 u_sun;          // unit vector towards the sun
 uniform sampler2D u_background; // water colour (rgb), for the murk
+uniform sampler2D u_trunkLook;  // baked trunk colours (trunkLookFS)
 out vec4 o;
 ${MASK}
 ${NOISE}
 ${LOGS}
 void main() {
   vec4 sec = logSection(v_seg, v_world);
+  // Shelf fungi stick out past the outline (baked: alpha 0.5, see trunkLookFS).
+  vec4 baked = texelFetch(u_trunkLook, clamp(ivec2(v_world), ivec2(0), textureSize(u_trunkLook, 0) - 1), 0);
+  bool fungus = baked.a > 0.25 && baked.a < 0.75;
+  if (fungus && u_pass == 1 && abs(sec.y) >= 0.9) {
+    // Past (or at) the edge: a flat shelf, lit from above.
+    o = vec4(baked.rgb * (0.7 + 0.45 * max(u_sun.z, 0.0)) * shadeTrunk(false), 1.0);
+    return;
+  }
   if (!logCovers(v_seg, sec)) discard;
   vec4 look = logLook(v_seg);
   float seed = look.x;
@@ -1031,14 +1372,8 @@ void main() {
   if ((u_pass == 0) == above) discard;
   if (u_pass == 2) { o = vec4(0.0, 0.0, 1.0, 1.0); return; }
 
-  vec3 wood = mix(vec3(0.66, 0.64, 0.58), vec3(0.56, 0.51, 0.43), seed);  // silver-grey .. grey-tan
-  wood *= 0.86 + 0.24 * vnoise(vec2(along * 0.05, s * 6.0 + seed * 9.0)); // long grain streaks
-  float check = abs(vnoise(vec2(along * 0.08, s * 9.0 + seed * 5.0)) - 0.5);
-  wood *= 1.0 - 0.38 * step(check, 0.035);                                  // dark checks along the grain
-  float bark = smoothstep(0.6, 0.7, fbm(vec2(along * 0.04, s * 1.2) + seed * 23.0));
-  wood = mix(wood, vec3(0.30, 0.25, 0.19), bark * 0.85);                    // remnant bark
-  float moss = smoothstep(0.58, 0.75, fbm(vec2(along * 0.03, s) + seed * 41.0)) * (1.0 - abs(s));
-  wood = mix(wood, vec3(0.34, 0.42, 0.18), moss * 0.75);
+  // Its colour, baked (trunkLookFS); the texel's own trunk where two cross.
+  vec3 wood = baked.rgb;
   // Paler end grain at the broken ends.
   float local = along - look.w;
   wood = mix(wood, vec3(0.74, 0.68, 0.55), max(step(local, jag0 + 1.2), step(len - jag1 - 1.2, local)));
@@ -1058,7 +1393,7 @@ void main() {
     vec4 water = texelFetch(u_background, ivec2(gl_FragCoord.xy), 0);
     // Like a fish at that depth, but steeper: wood fades fast in muddy water.
     float below = clamp((LOG_LAND - top) / LOG_LAND, 0.0, 1.0);
-    float murk = mix(MURK_SURFACE, MURK_DEEP, sqrt(clamp(below * LOG_MURK, 0.0, 1.0)));
+    float murk = murkAt(sqrt(clamp(below * LOG_MURK, 0.0, 1.0)));
     // Shaded by plants and floating mats, never by trunks (they would shadow their own top).
     c = underWater(c, below, vec3(1.0, 1.0, 0.0), murk, water.rgb, water.a);
     o = vec4(c, 1.0);
@@ -1071,6 +1406,7 @@ precision highp sampler2D;
 ${TUNE}
 uniform sampler2D u_plants; // 2 texels per plant: (x, y, scale, rotation), (kind, seed, brown, yellow)
 uniform sampler2D u_bloom;  // 1 texel per plant: nectar left in its flower (0..1)
+uniform sampler2D u_flowerLook; // 2 texels per plant: its head colours, fresh and withered (gpu/PondGpu.js)
 uniform int u_start;  // first plant of this batch
 uniform int u_verts;  // vertices per plant in this batch
 uniform vec2 u_resolution;
@@ -1088,7 +1424,8 @@ uniform float u_kindRegional[8]; // how much the regional palette applies
 uniform int u_blades; // blades drawn for this batch (level of detail)
 uniform vec2 u_light; // shadow pass: projection per px of height (0 in the colour pass)
 uniform vec2 u_wind;  // unit vector the wind blows towards
-uniform vec3 u_kindHeadColor[8];
+uniform vec4 u_windPair; // gusts roll along two fixed directions, cross-faded (see CLOUDS)
+uniform float u_windMix;
 out vec3 v_color;
 out float v_t;
 const float TAU = 6.28318530718;
@@ -1097,6 +1434,7 @@ const vec2 Q[6] = vec2[6](vec2(0, -1), vec2(1, -1), vec2(1, 1), vec2(0, -1), vec
 
 // Regional palettes seen from above in marshes (muted for the lo-fi look):
 // live olive-green stands, yellow-green fresh growth / sedge, dry tan-brown reed.
+// (The tips are mirrored in sim/Vegetation.js, for the withered flower colours.)
 const vec3 GREEN_BASE = vec3(0.19, 0.28, 0.11);
 const vec3 GREEN_TIP = vec3(0.35, 0.42, 0.17);
 const vec3 YELLOW_BASE = vec3(0.29, 0.33, 0.13);
@@ -1134,7 +1472,9 @@ void main() {
   vec2 bend = push / (1.0 + length(push)) * PLANT_BEND; // saturating
   // Breeze: plants lean downwind in gusts that roll across the marsh with the
   // wind, plus a little sideways flutter.
-  float gust = 0.5 + 0.5 * sin(u_time * 1.3 - dot(base, u_wind) * 0.012 + seed * 1.5);
+  // (Along fixed directions, cross-faded: a turning wind never sweeps them.)
+  float gust = 0.5 + 0.5 * mix(sin(u_time * 1.3 - dot(base, u_windPair.xy) * 0.012 + seed * 1.5),
+    sin(u_time * 1.3 - dot(base, u_windPair.zw) * 0.012 + seed * 1.5), u_windMix);
   vec2 wind = BREEZE * (u_wind * (0.02 + 0.07 * gust)
     + vec2(-u_wind.y, u_wind.x) * sin(u_time * 2.1 + seed * TAU) * 0.02);
   vec2 lean = bend + wind; // tip displacement per unit of blade length
@@ -1184,12 +1524,15 @@ void main() {
     float along = mix(len - head.y * scale, len, q.x);
     float halfW = max(head.z * scale, u_pixel) * 0.5;
     p = base + dir * along + vec2(-dir.y, dir.x) * q.y * halfW + lean * along + u_light * along;
-    // A flower drunk down by the midges fades towards a withered, leafy bud.
+    // A flower drunk down by the midges fades towards a withered, leafy bud
+    // (each plant's own colours, baked: Vegetation headColours).
     int plant = u_start + local;
     int bw = textureSize(u_bloom, 0).x;
     float bloom = texelFetch(u_bloom, ivec2(plant % bw, plant / bw), 0).r;
-    vec3 withered = mix(mix(u_kindTip[kind], regionTip, regional), vec3(0.42, 0.38, 0.26), 0.35);
-    v_color = mix(withered, u_kindHeadColor[kind], smoothstep(0.0, 1.0, bloom)) * (0.9 + 0.2 * q.x);
+    int lw = textureSize(u_flowerLook, 0).x;
+    vec3 fresh = texelFetch(u_flowerLook, ivec2(plant * 2 % lw, plant * 2 / lw), 0).rgb;
+    vec3 withered = texelFetch(u_flowerLook, ivec2((plant * 2 + 1) % lw, (plant * 2 + 1) / lw), 0).rgb;
+    v_color = mix(withered, fresh, smoothstep(0.0, 1.0, bloom)) * (0.9 + 0.2 * q.x);
     v_t = 1.0;
   }
   gl_Position = toClip(p);
@@ -1212,34 +1555,7 @@ void main() {
 }
 `
 
-// Light on the surface, coarse, for the midges' shade seeking (read back by
-// the engine): plant, scum, pad and trunk shadows (the mask) times cloud
-// shade. One texel per SHADE_CELL scene pixels, 1 = full sun.
-export const shadeFS = /* glsl */ `#version 300 es
-precision highp float;
-in vec2 v_uv;
-uniform sampler2D u_shadowMask;
-uniform vec2 u_view;
-uniform vec2 u_viewOffset;
-uniform bool u_cloudsOn;
-out vec4 o;
-${CLOUDS}
-void main() {
-  // Four taps across the texel's patch of the mask (scene y is up).
-  vec2 uv = vec2(v_uv.x, 1.0 - v_uv.y);
-  vec2 t = 0.25 / vec2(textureSize(u_shadowMask, 0)) * ${SHADE_CELL.toFixed(1)};
-  float shadow = 0.0;
-  for (int k = 0; k < 4; k++) {
-    vec3 m = texture(u_shadowMask, uv + t * vec2(k % 2 == 0 ? -1.0 : 1.0, k < 2 ? -1.0 : 1.0)).rgb;
-    shadow += max(max(m.r, m.g), m.b) * 0.25;
-  }
-  float light = mix(1.0, SHADOW, shadow);
-  if (u_cloudsOn) light *= mix(1.0, CLOUD_SHADE, cloudCover(v_uv * u_view + u_viewOffset));
-  o = vec4(light, 0.0, 0.0, 1.0);
-}
-`
-
-// Midges (sim/Insects.js), their egg rafts and ripples: one point each, in
+// Midges (species/midges.js; midgeVS feeds this from their GPU textures): one point each, in
 // scene pixels, by state (FLYING 0, ON_WATER 1, ON_FLOWER 2, FALLING 3,
 // DEAD 4, EGGS 5, EMPTY 6, RIPPLE 7, DRAGONFLY 8, DRAGON_EGGS 9):
 //   u_mode 0  on the water, under overhanging plants: a resting midge (2x2
@@ -1275,7 +1591,7 @@ void main() {
   int state = int(a_body.w);
   // Point size per mode and state; 0 = not drawn in this mode.
   float size = 0.0;
-  if (u_mode == 0) size = state == 1 ? 8.0 : state == 4 ? 2.0 : state == 5 ? 4.0 : state == 7 ? 16.0 : state == 9 ? 8.0 : 0.0;
+  if (u_mode == 0 || u_mode == 3) size = state == 1 ? 8.0 : state == 4 ? 2.0 : state == 5 ? 4.0 : state == 7 ? 16.0 : state == 9 ? 8.0 : 0.0;
   else if (u_mode == 1) size = state == 8 ? (mod(a_look.w, 2.0) > 0.5 ? 18.0 : 12.0) : state <= 2 && a_look.w > 0.5 ? 14.0 : state == 0 || state == 2 || state == 3 ? 2.0 : 0.0;
   else size = state == 1 ? 8.0 : state == 0 || state == 3 ? 2.0 : state == 8 ? 4.0 : 0.0;
   gl_PointSize = 1.0;
@@ -1302,7 +1618,7 @@ void main() {
 }
 `
 
-// Motion trails of flying insects (engine/InsectWorld.js builds them): lines
+// Lines in scene pixels from a CPU buffer (render/focus.js overlays): lines
 // through each one's last few positions, in scene pixels like insectVS, with
 // premultiplied colours fading towards the tail.
 export const trailVS = /* glsl */ `#version 300 es
@@ -1341,7 +1657,7 @@ uniform int u_mode;
 uniform float u_time;
 out vec4 o;
 ${TUNE}
-const float RIPPLE_LIFE = ${RIPPLE_LIFE.toFixed(2)}; // s (Insects.js)
+const float RIPPLE_LIFE = ${RIPPLE_LIFE.toFixed(2)}; // s
 const vec2 LEGS[4] = vec2[4](vec2(-2.5, -1.5), vec2(2.5, -1.5), vec2(-2.5, 1.5), vec2(2.5, 1.5));
 vec4 premul(vec3 c, float a) { return vec4(c * a, a); }
 void main() {
@@ -1462,7 +1778,7 @@ void main() {
 // Lily pads: a disc with a wedge notch, veins and an optional flower.
 export const padVS = /* glsl */ `#version 300 es
 layout(location = 0) in vec4 a_pad;  // x, y, radius, angle
-layout(location = 1) in vec4 a_look; // seed, flower, -, -
+layout(location = 1) in vec4 a_look; // seed, flower (LilyPads FLOWER), variety (VARIETY), -
 uniform vec2 u_resolution;
 uniform vec2 u_viewOffset;
 uniform vec2 u_shift;
@@ -1474,7 +1790,7 @@ uniform sampler2D u_elev;
 uniform float u_elevCell;
 uniform vec2 u_elevDims;
 out vec2 v_local;
-out vec2 v_look;
+out vec3 v_look;
 const float LAND = ${LAND_LEVEL.toFixed(4)};
 const float ELEV_PER_PX = ${LOG_ELEV_PER_PX.toFixed(6)};
 
@@ -1490,7 +1806,7 @@ void main() {
   float c = cos(angle);
   float s = sin(angle);
   v_local = vec2(c * corner.x + s * corner.y, -s * corner.x + c * corner.y);
-  v_look = a_look.xy;
+  v_look = a_look.xyz;
   // Shadow pass: the shadow falls on the floor, as far below as the water is deep.
   float floorE = texture(u_elev, (a_pad.xy / u_elevCell + 0.5) / u_elevDims).r;
   vec2 p = a_pad.xy + offset + corner * a_pad.z + u_shift + u_light * clamp(LAND - floorE, 0.0, LAND) / ELEV_PER_PX;
@@ -1502,7 +1818,7 @@ void main() {
 export const padFS = /* glsl */ `#version 300 es
 precision highp float;
 in vec2 v_local;
-in vec2 v_look;
+in vec3 v_look; // seed, flower (0 none, 1 open, 2 bud), variety (0 pink, 1 white, 2 yellow)
 uniform int u_shadowPass; // 1: write the pad's shadow into the mask
 out vec4 o;
 ${MASK}
@@ -1521,10 +1837,30 @@ void main() {
   col *= 1.0 - 0.12 * smoothstep(0.82, 0.95, d);          // darker rim
   col *= 1.0 - 0.1 * step(0.94, abs(sin(a * 4.5 + seed * 6.0))) * step(0.15, d); // veins
 
-  if (v_look.y > 0.5) {
-    float petals = 0.42 * (0.65 + 0.35 * abs(cos(a * 4.0 + seed * 3.0)));
-    if (d < petals) col = mix(vec3(0.86, 0.62, 0.68), vec3(0.93, 0.86, 0.84), d / petals);
-    if (d < 0.11) col = vec3(0.86, 0.72, 0.30);
+  // The colony's variety: petal colour at the base and at the tip.
+  int variety = int(v_look.z + 0.5);
+  vec3 petalBase = variety == 0 ? vec3(0.84, 0.52, 0.62) : variety == 1 ? vec3(0.90, 0.88, 0.80) : vec3(0.90, 0.76, 0.28);
+  vec3 petalTip = variety == 0 ? vec3(0.95, 0.80, 0.84) : variety == 1 ? vec3(0.97, 0.96, 0.92) : vec3(0.97, 0.90, 0.50);
+  int flower = int(v_look.y + 0.5);
+  if (flower == 1) {
+    // Open bloom: an outer ring of pointed petals and an inner one between
+    // them, a little darker towards the base; a golden centre.
+    float size = 0.5 + 0.15 * fract(seed * 7.3);
+    float outer = size * (0.55 + 0.45 * pow(abs(cos(a * 4.0 + seed * 3.0)), 0.6));
+    float inner = size * 0.68 * (0.55 + 0.45 * pow(abs(cos(a * 4.0 + seed * 3.0 + 0.785)), 0.6));
+    if (d < outer) col = mix(petalBase, petalTip, d / outer) * 0.92;
+    if (d < inner) col = mix(petalBase, petalTip, d / inner);
+    if (d < size * 0.24) col = vec3(0.88, 0.70, 0.26) * (0.9 + 0.2 * step(0.5, fract(a * 2.0 + d * 20.0)));
+  } else if (flower == 2) {
+    // Closed bud: a small pointed oval off-centre, green at the base turning
+    // to the bloom's colour at its tip.
+    float ba = seed * 6.2832;
+    vec2 q = mat2(cos(ba), -sin(ba), sin(ba), cos(ba)) * (v_local - vec2(0.15, -0.1));
+    float x = q.x / 0.36;
+    if (abs(x) < 1.0 && abs(q.y) < 0.16 * (1.0 - x * x)) {
+      col = mix(vec3(0.30, 0.45, 0.22), petalTip, smoothstep(-0.2, 0.9, x));
+      if (q.y > 0.02) col *= 0.85; // the shaded side
+    }
   }
   o = vec4(col * shade(), 1.0);
 }
@@ -1536,9 +1872,18 @@ void main() {
 // ruler-straight. Phase in radians; sin(phase) = 1 on a crest.
 const RIPPLES = /* glsl */ `
 const float TAU = 6.28318530718;
-float ripplePhase(vec2 world, float time) {
-  float bend = cloud(world / 140.0 - u_wind * time * 0.004) + cloud(world / 45.0 + 0.3) * 0.35;
-  return dot(world, u_wind) * TAU / RIPPLE_WAVELENGTH - time * RIPPLE_SPEED + bend * 18.0;
+// For the fixed direction wd (see windA / windB).
+float ripplePhase(vec2 world, float time, vec2 wd) {
+  float bend = cloud(world / 140.0 - u_windTravel * 0.004) + cloud(world / 45.0 + 0.3) * 0.35;
+  return dot(world, wd) * TAU / RIPPLE_WAVELENGTH - time * RIPPLE_SPEED + bend * 18.0;
+}
+// sin of the phase, both directions cross-faded: 1 on a crest.
+float rippleWave(vec2 world, float time) {
+  return mix(sin(ripplePhase(world, time, windA())), sin(ripplePhase(world, time, windB())), u_windMix) * windMixNorm();
+}
+// Its slope (cos of the phase), cross-faded alike.
+float rippleSlope(vec2 world, float time) {
+  return mix(cos(ripplePhase(world, time, windA())), cos(ripplePhase(world, time, windB())), u_windMix) * windMixNorm();
 }
 `
 
@@ -1570,7 +1915,7 @@ const vec3 CAUSTIC_LIGHT = vec3(1.0, 0.95, 0.75);
 // Silt: noise warped twice by noise that itself drifts, so it curls.
 float swirl(vec2 world) {
   float t = u_time * SWIRL_SPEED;
-  vec2 p = world / SWIRL_SCALE - u_wind * t * 0.5;
+  vec2 p = world / SWIRL_SCALE - u_windTravel * SWIRL_SPEED * 0.5;
   vec2 w1 = vec2(cloud(p * 0.7 + vec2(t, 0.31)), cloud(p * 0.7 + vec2(0.63, -t))) - 0.5;
   vec2 q = p + w1 * 0.6;
   vec2 w2 = vec2(cloud(q * 1.3 + 0.2 - t * 0.7), cloud(q * 1.3 + 0.8 + t * 0.7)) - 0.5;
@@ -1581,10 +1926,11 @@ float swirl(vec2 world) {
 float caustics(vec2 world) {
   vec2 p = world / CAUSTIC_SCALE;
   float t = u_time * CAUSTIC_SPEED;
-  // One layer whose ridges (noise = 0.5) are the bright lines, wobbled by a
-  // second, slower layer so the web shimmers instead of sliding.
+  // One layer whose ridges (noise = 0.5) are the bright lines, drifting
+  // downwind with the ripples that focus them, wobbled by a second, slower
+  // layer so the web shimmers instead of only sliding.
   vec2 wobble = vec2(cloud(p * 0.8 + vec2(-0.6, 0.8) * t + 0.5), cloud(p * 0.8 + vec2(0.7, 0.5) * t + 0.2)) - 0.5;
-  float a = cloud(p + vec2(0.9, 0.5) * t + wobble * 0.12);
+  float a = cloud(p - u_causticShift + wobble * 0.12);
   float r = 1.0 - abs(2.0 * a - 1.0);
   return step(0.95, r) + step(0.985, r);
 }
@@ -1601,7 +1947,7 @@ void main() {
   float shallow = 1.0 - smoothstep(0.12, 0.45, depth); // where ripples show
   if (shallow > 0.0) {
     // Refraction: the floor shifts with the ripple slope (scene y is flipped).
-    float slope = cos(ripplePhase(world, u_time)) * shallow * u_windStrength;
+    float slope = rippleSlope(world, u_time) * shallow * u_windStrength;
     ivec2 off = ivec2(round(u_wind * slope * REFRACTION * vec2(1.0, -1.0)));
     vec4 moved = texelFetch(u_background, clamp(px + off, ivec2(0), textureSize(u_background, 0) - 1), 0);
     if (moved.a > 0.0) c = moved.rgb; // never pull in land colour
@@ -1646,15 +1992,19 @@ ${CLOUDS}
 ${RIPPLES}
 const vec3 GLINT = vec3(0.82, 0.86, 0.8);
 
+// Noise stretched along the crests (direction wd), breaking them into dashes.
+float rippleDash(vec2 world, vec2 wd) {
+  return cloud(vec2(dot(world, wd) / 40.0, dot(world, vec2(-wd.y, wd.x)) / 90.0) - vec2(u_time * 0.02, 0.0));
+}
+
 // Shallow ripples: sparse glints on the crests, livelier in fish wakes.
 float shallowRipples(vec2 world, float depth) {
   float shallow = 1.0 - smoothstep(0.1, 0.4, depth);
   if (shallow <= 0.0) return 0.0;
   float wake = clamp(length(texture(u_sway, world / u_swayExtent).xy) * 0.6, 0.0, 1.0);
-  float crest = sin(ripplePhase(world, u_time));
+  float crest = rippleWave(world, u_time);
   if (crest < 0.86 - 0.12 * wake) return 0.0;
-  vec2 across = vec2(-u_wind.y, u_wind.x);
-  float dash = cloud(vec2(dot(world, u_wind) / 40.0, dot(world, across) / 90.0) - vec2(u_time * 0.02, 0.0));
+  float dash = mix(rippleDash(world, windA()), rippleDash(world, windB()), u_windMix);
   if (dash < 0.68 - 0.18 * u_windStrength - 0.25 * wake) return 0.0;
   return RIPPLE_ALPHA * min(1.0, shallow * 1.5) * u_windStrength * (1.0 + wake);
 }
@@ -1698,23 +2048,200 @@ uniform float u_levels;
 uniform bool u_cloudsOn;
 uniform vec2 u_viewOffset;
 uniform vec2 u_cell;       // world px per scene pixel
+uniform vec3 u_sunlight;   // light on the scene: brightness and tint from the sun's height
 out vec4 o;
 ${CLOUDS}
 const float BAYER[16] = float[16](0.0, 8.0, 2.0, 10.0, 12.0, 4.0, 14.0, 6.0, 3.0, 11.0, 1.0, 9.0, 15.0, 7.0, 13.0, 5.0);
 
 void main() {
   ivec2 t = ivec2(gl_FragCoord.xy);
-  vec3 c = texelFetch(u_scene, t, 0).rgb;
+  vec3 c = texelFetch(u_scene, t, 0).rgb * u_sunlight;
   // Scene row 0 is the bottom of the screen; world y grows downwards.
   vec2 world = u_viewOffset + (vec2(t.x, u_low.y - 1 - t.y) + 0.5) * u_cell;
-  if (u_cloudsOn) c *= mix(1.0, CLOUD_SHADE, cloudCover(world));
-
-
   float b = mix(0.5, BAYER[(t.x & 3) + (t.y & 3) * 4] / 16.0, DITHER);
   c = floor(c * u_levels + b) / u_levels;
+  // Cloud shade after the colour levels, itself in dithered steps: shading
+  // the levels would squeeze dark gradients (deep to mid water) into one or
+  // two levels with hard contours; this way the shade stays pixelated but
+  // the shadowed scene keeps the bands it has in the sun.
+  if (u_cloudsOn) {
+    float shade = mix(1.0, CLOUD_SHADE, cloudCover(world));
+    c *= floor(shade * u_levels + b) / u_levels;
+  }
 
   vec2 q = gl_FragCoord.xy / vec2(u_low) - 0.5;
   c *= 1.0 - VIGNETTE * dot(q, q);
   o = vec4(c, 1.0);
+}
+`
+
+
+// Midges drawn straight from their GPU species textures (gpu/boids/BoidKernel.js,
+// species/midges.js): insectVS with its point attributes read by vertex id
+// (state: x, y; aux: height in w, point state in y, an egg's ripeness in z;
+// traits: seed), the selected one flagged.
+const MIDGE_FETCH = /* glsl */ `
+uniform highp sampler2D u_mState;
+uniform highp sampler2D u_mAux;
+uniform highp sampler2D u_mTraits;
+uniform int u_mTexW;
+uniform int u_mTexShift;
+uniform int u_mCount;
+uniform int u_mSelected;
+ivec2 midgeTexel(int i) { return ivec2(i & (u_mTexW - 1), i >> u_mTexShift); }`
+export const midgeVS = insectVS
+  .replace(
+    `layout(location = 0) in vec4 a_body; // x, y, height above the water (px), state
+layout(location = 1) in vec4 a_look; // seed, ripple age (s), egg maturity (0..1), selected (midges) / brood (rafts)`,
+    `${MIDGE_FETCH}
+uniform highp sampler2D u_mAux1;
+uniform float u_time;     // sim time (s)
+uniform float u_bodyTime; // params.insectBodyTime
+const float RIPPLE_LIFE = ${RIPPLE_LIFE.toFixed(2)};
+vec4 a_body; // x, y, height above the water (px), state
+vec4 a_look; // seed, ripple age (mode 3), egg ripeness, selected`,
+  )
+  .replace(
+    'void main() {\n  int state = int(a_body.w);',
+    `void main() {
+  ivec2 mc = midgeTexel(gl_VertexID);
+  vec4 ms = texelFetch(u_mState, mc, 0);
+  vec4 ma = texelFetch(u_mAux, mc, 0);
+  a_body = vec4(ms.xy, ma.w, gl_VertexID < u_mCount ? ma.y : 6.0);
+  a_look = vec4(texelFetch(u_mTraits, mc, 0).x, 0.0, ma.y == 5.0 ? ma.z : 0.0, gl_VertexID == u_mSelected ? 1.0 : 0.0); // an egg's ripeness in aux.z
+  if (u_mode == 3) {
+    // Ripples (drawn as state 7): a ring spreading where it laid an egg
+    // (aux1: when, where), or where its body fell (dead: its body timer
+    // counts down from its own body time, species/midges.js), on water only.
+    vec4 m1 = texelFetch(u_mAux1, mc, 0);
+    float age = m1.x >= 0.0 ? u_time - m1.x : 1e9;
+    vec2 at = m1.yz;
+    if (ma.y == 4.0) {
+      float landed = u_bodyTime * (0.7 + 0.6 * fract(a_look.x * 91.7)) - ma.z;
+      if (landed < age) { age = landed; at = ms.xy; }
+    }
+    float floorE = texture(u_elev, (at / u_elevCell + 0.5) / u_elevDims).r;
+    bool on = gl_VertexID < u_mCount && age >= 0.0 && age < RIPPLE_LIFE && floorE < LAND;
+    a_body = vec4(at, 0.0, on ? 7.0 : 6.0);
+    a_look.y = age;
+  }
+  int state = int(a_body.w);`,
+  )
+
+// Midge motion trails: per flying midge a line from where it was at the
+// frame's start (u_mPrev) to where it is, fading towards the tail; a hop
+// longer than u_maxHop is not drawn.
+export const midgeTrailVS = /* glsl */ `#version 300 es
+precision highp float;
+${MIDGE_FETCH}
+uniform highp sampler2D u_mPrev;
+uniform vec2 u_view;
+uniform vec2 u_viewOffset;
+uniform vec2 u_cell;
+uniform float u_maxHop;
+uniform vec3 u_colour;
+uniform float u_alpha;
+out vec4 v_colour;
+void main() {
+  int i = gl_VertexID / 2;
+  int end = gl_VertexID - i * 2;
+  ivec2 mc = midgeTexel(i);
+  vec2 p1 = texelFetch(u_mState, mc, 0).xy;
+  vec2 p0 = texelFetch(u_mPrev, mc, 0).xy;
+  float hop = distance(p0, p1);
+  if (i >= u_mCount || texelFetch(u_mAux, mc, 0).y != 0.0 || hop < 1.0 || hop > u_maxHop) {
+    gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+    v_colour = vec4(0.0);
+    return;
+  }
+  vec2 p = end == 0 ? p0 : p1;
+  float a = end == 0 ? 0.0 : u_alpha;
+  vec2 uv = ((p - u_viewOffset) / u_cell + 0.5) / (u_view / u_cell);
+  gl_Position = vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 0.0, 1.0);
+  v_colour = vec4(u_colour * a, a);
+}
+`
+
+// What the selected boid of a GPU species sees: a faint line to each of its
+// kind in flight within its range (u_rangeTex red channel, per boid).
+export const seenBoidsVS = /* glsl */ `#version 300 es
+precision highp float;
+${MIDGE_FETCH}
+uniform highp sampler2D u_rangeTex;
+uniform int u_rangeStride;
+uniform vec2 u_view;
+uniform vec2 u_viewOffset;
+uniform vec2 u_cell;
+uniform vec4 u_colour; // rgb, alpha
+out vec4 v_colour;
+void main() {
+  int i = gl_VertexID / 2;
+  ivec2 sc = midgeTexel(u_mSelected);
+  vec2 me = texelFetch(u_mState, sc, 0).xy;
+  float range = texelFetch(u_rangeTex, ivec2(sc.x * u_rangeStride, sc.y), 0).r;
+  ivec2 mc = midgeTexel(i);
+  vec2 p = texelFetch(u_mState, mc, 0).xy;
+  if (i >= u_mCount || i == u_mSelected || texelFetch(u_mAux, mc, 0).y != 0.0 || distance(me, p) > range) {
+    gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+    v_colour = vec4(0.0);
+    return;
+  }
+  vec2 q = gl_VertexID % 2 == 0 ? me : p;
+  vec2 uv = ((q - u_viewOffset) / u_cell + 0.5) / (u_view / u_cell);
+  gl_Position = vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 0.0, 1.0);
+  v_colour = vec4(u_colour.rgb * u_colour.a, u_colour.a);
+}
+`
+
+// What the selected boid sees of the item sources (gpu/boids/ItemSources.js):
+// a small ring round each item within its range, styled per source; flowers
+// (sources 0 and 1) in their colour as drawn (as the midge sees it: nectar
+// from withered to fresh). 12 segments, 24 vertices per item.
+export const seenItemsVS = /* glsl */ `#version 300 es
+precision highp float;
+${MIDGE_FETCH}
+uniform highp sampler2D u_rangeTex;
+uniform int u_rangeStride;
+uniform highp sampler2D u_items;
+uniform highp sampler2D u_nectar;
+uniform highp sampler2D u_flowerLook;
+uniform int u_itemsW;
+uniform int u_itemCount;
+uniform vec4 u_srcColour[4]; // rgb, alpha (0: not shown)
+uniform float u_srcRadius[4];
+uniform vec2 u_view;
+uniform vec2 u_viewOffset;
+uniform vec2 u_cell;
+out vec4 v_colour;
+void main() {
+  int k = gl_VertexID / 24;
+  int v = gl_VertexID - k * 24;
+  int seg = v / 2 + (v % 2);
+  vec4 it = texelFetch(u_items, ivec2(k % u_itemsW, k / u_itemsW), 0);
+  int src = int(it.w);
+  ivec2 sc = midgeTexel(u_mSelected);
+  vec2 me = texelFetch(u_mState, sc, 0).xy;
+  float range = texelFetch(u_rangeTex, ivec2(sc.x * u_rangeStride, sc.y), 0).r;
+  bool shown = k < u_itemCount && u_srcColour[src].a > 0.0 && distance(me, it.xy) <= range;
+  if (!shown) {
+    gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+    v_colour = vec4(0.0);
+    return;
+  }
+  float t = float(seg) / 12.0 * 6.2832;
+  vec2 q = it.xy + vec2(cos(t), sin(t)) * u_srcRadius[src];
+  vec2 uv = ((q - u_viewOffset) / u_cell + 0.5) / (u_view / u_cell);
+  gl_Position = vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 0.0, 1.0);
+  vec4 c = u_srcColour[src];
+  if (src < 2) {
+    int i = int(it.z);
+    int w = textureSize(u_nectar, 0).x;
+    int lw = textureSize(u_flowerLook, 0).x;
+    float nectar = texelFetch(u_nectar, ivec2(i % w, i / w), 0).r;
+    vec3 fresh = texelFetch(u_flowerLook, ivec2(i * 2 % lw, i * 2 / lw), 0).rgb;
+    vec3 withered = texelFetch(u_flowerLook, ivec2((i * 2 + 1) % lw, (i * 2 + 1) / lw), 0).rgb;
+    c.rgb = mix(withered, fresh, smoothstep(0.0, 1.0, nectar));
+  }
+  v_colour = vec4(c.rgb * c.a, c.a);
 }
 `

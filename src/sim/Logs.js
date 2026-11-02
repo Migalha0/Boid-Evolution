@@ -16,9 +16,9 @@ export const MAX_LOG_SEGMENTS = 64
 export const LOG_STRIDE = 12
 
 /** How a segment end is drawn. */
-export const END_HIDDEN = 0 // inside another segment (a branch's base)
-export const END_BROKEN = 1 // splintered end of the trunk or a branch
-export const END_JOINT = 2 // rounded, overlapping the next segment of a bent trunk
+const END_HIDDEN = 0 // inside another segment (a branch's base)
+const END_BROKEN = 1 // splintered end of the trunk or a branch
+const END_JOINT = 2 // rounded, overlapping the next segment of a bent trunk
 /** Segments per trunk: a few nodes with a little bend between each. */
 const TRUNK_NODES = 4
 const MAX_BEND = 0.28 // radians either way at each node

@@ -8,6 +8,14 @@ export function randomGenome(genes) {
   return genes.map((g) => g.min + Math.random() * (g.max - g.min))
 }
 
+/**
+ * How far a gene can go either way: mutation may flip its sign, so every gene
+ * lives in ±(the larger end of its range); random genomes still start in it.
+ */
+export function geneLimit(g) {
+  return Math.max(Math.abs(g.min), Math.abs(g.max))
+}
+
 /** A genome as { key: value }, and back (missing genes are drawn at random, the rest clamped). */
 export function genomeToObject(genes, genome) {
   return Object.fromEntries(genes.map((g, k) => [g.key, genome[k]]))
@@ -15,7 +23,8 @@ export function genomeToObject(genes, genome) {
 export function objectToGenome(genes, obj) {
   return genes.map((g) => {
     const v = Number(obj?.[g.key])
-    return Number.isFinite(v) ? Math.min(g.max, Math.max(g.min, v)) : g.min + Math.random() * (g.max - g.min)
+    const lim = geneLimit(g)
+    return Number.isFinite(v) ? Math.min(lim, Math.max(-lim, v)) : g.min + Math.random() * (g.max - g.min)
   })
 }
 
@@ -23,12 +32,17 @@ function gauss() {
   return Math.sqrt(-2 * Math.log(1 - Math.random())) * Math.cos(2 * Math.PI * Math.random())
 }
 
-/** A copy of a genome, each gene mutated with chance `rate` by about `size` of its range. */
-export function mutate(genes, genome, rate, size) {
+/**
+ * A copy of a genome, each gene mutated with chance `rate`: by about `size`
+ * of its range, or (chance `flip` of a mutation) flipped in sign.
+ */
+export function mutate(genes, genome, rate, size, flip = 0) {
   return Array.from(genome, (v, k) => {
     if (Math.random() >= rate) return v
+    if (Math.random() < flip) return -v
     const g = genes[k]
-    return Math.min(g.max, Math.max(g.min, v + gauss() * size * (g.max - g.min)))
+    const lim = geneLimit(g)
+    return Math.min(lim, Math.max(-lim, v + gauss() * size * (g.max - g.min)))
   })
 }
 

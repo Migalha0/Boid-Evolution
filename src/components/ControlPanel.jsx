@@ -1,7 +1,10 @@
 import { useRef, useState } from 'react'
-import { MAX_BOIDS } from '../gpu/GpuBoidSim.js'
-import { Hint, LogSlider, Section, Slider, Toggle } from './controls.jsx'
-import { DragonflyTab, SelectedDragonfly } from './DragonflyPanel.jsx'
+import { MAX_BOIDS } from '../gpu/boids/BoidKernel.js'
+import { PLANT_KINDS, plantAmountKey } from '../sim/Vegetation.js'
+import { FADE_TRANSITION, FADED, useIdleFade } from './useIdleFade.js'
+import { Hint, LogSlider, RangeModes, Section, Slider, TickRate, Toggle } from './controls.jsx'
+import { FISH_SENSES } from '../species/fish.js'
+import { ForceLegend, dangerButton } from './evolution.jsx'
 import { MidgeTab, SelectedMidge } from './MidgePanel.jsx'
 
 /** Knob sweep for value dials (range mode): -135°..135°, gap at the bottom. */
@@ -98,41 +101,36 @@ function Dial({ label, value, onChange, step = 1, range, unit = '°', knob = 'fi
   )
 }
 
-const TABS = ['Fish', 'Midges', 'Dragonflies', 'Pond', 'Water', 'Sky', 'View']
+/** Tabs in two groups: who lives in the pond, and the pond itself (and how it is shown). */
+const TAB_GROUPS = [
+  ['Creatures', ['Fish', 'Midges']],
+  ['World', ['Pond', 'Water', 'Weather', 'View']],
+]
+
+const secondary = 'rounded-md bg-slate-800 px-2 py-1.5 text-xs text-slate-200 hover:bg-slate-700'
+
+/** A plant kind's name for a slider; the two flowering ones say their colour (the midges feed on them). */
+const plantLabel = (name) => `${name[0].toUpperCase()}${name.slice(1)}${name === 'iris' ? ' (yellow flowers)' : name === 'pickerelweed' ? ' (purple flowers)' : ''}`
 
 const ms = (v) => (v == null ? 'n/a' : `${v.toFixed(2)} ms`)
 
-function Segmented({ value, options, onChange }) {
-  return (
-    <div className="grid grid-cols-3 gap-1 rounded-md bg-slate-800/80 p-0.5">
-      {options.map((o) => (
-        <button
-          key={o.value}
-          type="button"
-          onClick={() => onChange(o.value)}
-          className={`rounded px-2 py-1 text-xs transition-colors ${
-            value === o.value ? 'bg-sky-500/90 text-white' : 'text-slate-300 hover:bg-slate-700'
-          }`}
-        >
-          {o.label}
-        </button>
-      ))}
-    </div>
-  )
-}
-
-export default function ControlPanel({ params, setParam, stats, onReset, onNewMap, onShuffleLogs, onDefaults, midgeActions, dragonflyActions }) {
+export default function ControlPanel({ params, setParam, stats, onReset, onNewMap, onRandomizeWorld, onShuffleLogs, onDefaults, midgeActions }) {
   const [open, setOpen] = useState(true)
-  const [tab, setTab] = useState(TABS[0])
+  const [tab, setTab] = useState('Fish')
+  // Collapsed and left alone for a while, it all but disappears.
+  const [faded, fadeHandlers] = useIdleFade(!open)
   const p = params
 
   return (
-    <aside className="pointer-events-auto absolute right-3 top-3 flex max-h-[calc(100%-1.5rem)] w-72 max-w-[calc(100%-1.5rem)] flex-col overflow-hidden rounded-xl border border-slate-700/60 bg-slate-900/95 shadow-2xl">
+    <aside
+      {...fadeHandlers}
+      className={`pointer-events-auto absolute right-3 top-3 flex max-h-[calc(100%-1.5rem)] w-72 max-w-[calc(100%-1.5rem)] flex-col overflow-hidden rounded-xl border ${FADE_TRANSITION} ${faded ? FADED : 'border-slate-700/60 bg-slate-900/95 shadow-2xl'}`}
+    >
       <header className="flex items-center justify-between border-b border-slate-700/60 px-4 py-2.5">
         <div>
-          <h2 className="text-sm font-semibold text-slate-100">Boids</h2>
+          <h2 className="text-sm font-semibold text-slate-100">Pond</h2>
           <p className="font-mono text-[11px] tabular-nums text-slate-400">
-            {stats.fps.toFixed(0)} fps · {stats.count.toLocaleString()} boids
+            {stats.fps.toFixed(0)} fps · {stats.count.toLocaleString()} fish
           </p>
           <p className="font-mono text-[11px] tabular-nums text-slate-500" title="GPU time to simulate and draw one frame (measured synchronously where the GPU cannot time itself). The fps above is capped by the display's refresh rate.">
             frame {ms(stats.frameMs)}
@@ -155,35 +153,38 @@ export default function ControlPanel({ params, setParam, stats, onReset, onNewMa
 
       {open && (
         <div className="space-y-5 overflow-y-auto px-4 py-4">
-          <div className="grid grid-cols-2 gap-2">
-            <button
-              type="button"
-              onClick={() => setParam('paused', !p.paused)}
-              className="rounded-md bg-sky-500/90 px-2 py-1.5 text-xs font-medium text-white hover:bg-sky-500"
-            >
-              {p.paused ? 'Play' : 'Pause'}
-            </button>
-            <button
-              type="button"
-              onClick={onReset}
-              className="rounded-md bg-slate-800 px-2 py-1.5 text-xs text-slate-200 hover:bg-slate-700"
-            >
-              Scatter
-            </button>
-            <button
-              type="button"
-              onClick={onNewMap}
-              className="rounded-md bg-slate-800 px-2 py-1.5 text-xs text-slate-200 hover:bg-slate-700"
-            >
-              New map
-            </button>
-            <button
-              type="button"
-              onClick={onDefaults}
-              className="rounded-md bg-slate-800 px-2 py-1.5 text-xs text-slate-200 hover:bg-slate-700"
-            >
-              Defaults
-            </button>
+          {/* Time: play / pause and how fast the whole world runs. */}
+          <div className="space-y-2">
+            <div className="flex items-end gap-3">
+              <button
+                type="button"
+                onClick={() => setParam('paused', !p.paused)}
+                className="w-16 shrink-0 rounded-md bg-sky-500/90 px-2 py-1.5 text-xs font-medium text-white hover:bg-sky-500"
+              >
+                {p.paused ? 'Play' : 'Pause'}
+              </button>
+              <div className="min-w-0 flex-1">
+                <Slider label="Sim speed" value={p.simSpeed} min={1} max={30} step={1} onChange={(v) => setParam('simSpeed', v)} unit="×" />
+              </div>
+            </div>
+            {p.showInsects && Math.round(p.simSpeed * stats.insectPace) < p.simSpeed - 1 && (
+              <Hint>
+                The insects can only keep up with about {Math.max(1, Math.round(p.simSpeed * stats.insectPace))}× here (they run on one CPU core of their own): they live slower than the fish, but every step is still a full one, so evolution is the same, only slower. For fast training use <code>npm run train</code> (headless, hundreds of times real time).
+              </Hint>
+            )}
+          </div>
+
+          {/* The world: a new pond, or new conditions on this one. */}
+          <div className="space-y-1.5">
+            <div className="grid grid-cols-2 gap-2">
+              <button type="button" onClick={onNewMap} className={secondary} title="New shores, islands and floor (and the plants, trunks and pads that go with them)">
+                New map
+              </button>
+              <button type="button" onClick={onRandomizeWorld} className={secondary} title="Same shores and floor shape; new plant mix, water depth and murk, trunks, floor details, sun, wind and clouds">
+                Randomize world
+              </button>
+            </div>
+            <p className="text-[10px] leading-snug text-slate-500">New map: new shores and floor. Randomize world: this map with new plants, depth, water and weather. Creatures stay.</p>
           </div>
 
           {stats.selected?.speed != null && (
@@ -194,31 +195,29 @@ export default function ControlPanel({ params, setParam, stats, onReset, onNewMa
               <div>speed {stats.selected.speed.toFixed(1)} px/s</div>
               <div>steering {stats.selected.steering.toFixed(1)} px/s²</div>
               <div>neighbours {stats.selected.neighbors}</div>
+              <ForceLegend senses={stats.selected.senses} list={FISH_SENSES} />
             </div>
           )}
 
-          <Slider label="Sim speed" value={p.simSpeed} min={1} max={30} step={1} onChange={(v) => setParam('simSpeed', v)} unit="×" />
-          {p.showInsects && stats.insectPace < 0.95 && (
-            <Hint>
-              The insects can only keep up with about {Math.max(1, p.simSpeed * stats.insectPace).toFixed(0)}× here (they run on one CPU core of their own): they live slower than the fish, but every step is still a full one, so evolution is the same, only slower. For fast training use <code>npm run train</code> (headless, hundreds of times real time).
-            </Hint>
-          )}
-
           <SelectedMidge midge={stats.midges?.selected} />
-          <SelectedDragonfly dragonfly={stats.dragonflies?.selected} />
 
-          <nav className="flex flex-wrap gap-1 rounded-md bg-slate-800/80 p-0.5">
-            {TABS.map((t) => (
-              <button
-                key={t}
-                type="button"
-                onClick={() => setTab(t)}
-                className={`flex-auto rounded px-1.5 py-1 text-[11px] transition-colors ${
-                  tab === t ? 'bg-sky-500/90 text-white' : 'text-slate-300 hover:bg-slate-700'
-                }`}
-              >
-                {t}
-              </button>
+          <nav className="space-y-1.5">
+            {TAB_GROUPS.map(([group, tabs]) => (
+              <div key={group}>
+                <div className="mb-0.5 text-[10px] uppercase tracking-wider text-slate-500">{group}</div>
+                <div className="flex gap-1 rounded-md bg-slate-800/80 p-0.5">
+                  {tabs.map((t) => (
+                    <button
+                      key={t}
+                      type="button"
+                      onClick={() => setTab(t)}
+                      className={`flex-1 rounded px-1.5 py-1 text-[11px] transition-colors ${tab === t ? 'bg-sky-500/90 text-white' : 'text-slate-300 hover:bg-slate-700'}`}
+                    >
+                      {t}
+                    </button>
+                  ))}
+                </div>
+              </div>
             ))}
           </nav>
 
@@ -226,6 +225,21 @@ export default function ControlPanel({ params, setParam, stats, onReset, onNewMa
             <>
               <Section title="Population">
                 <LogSlider label="Count" value={p.count} min={10} max={MAX_BOIDS} zero onChange={(v) => setParam('count', v)} />
+                <RangeModes value={p.fishVisionMode} onChange={(v) => setParam('fishVisionMode', v)} />
+                <div className="grid grid-cols-[1fr_auto] gap-1">
+                  <button type="button" onClick={onReset} className={secondary} title="Every fish to a random spot in open water">
+                    Scatter fish
+                  </button>
+                  <button
+                    type="button"
+                    className={dangerButton}
+                    disabled={!p.count}
+                    onClick={() => window.confirm('Remove every fish?') && setParam('count', 0)}
+                    title="Every fish gone (the count goes to 0)"
+                  >
+                    Remove all
+                  </button>
+                </div>
               </Section>
               <Section title="Behaviour">
                 <Slider label="Alignment" value={p.alignWeight} min={0} max={3} step={0.05} onChange={(v) => setParam('alignWeight', v)} />
@@ -239,6 +253,9 @@ export default function ControlPanel({ params, setParam, stats, onReset, onNewMa
                 <Slider label="Personal space" value={p.separation} min={2} max={80} onChange={(v) => setParam('separation', v)} unit=" px" />
                 <Hint>Neighbours, the shore and trunks are all seen within the vision cone.</Hint>
               </Section>
+              <TickRate value={p.fishLookEvery} onChange={(v) => setParam('fishLookEvery', v)}>
+                How often a fish senses the rest of the shoal (the shore and trunks it checks every step).
+              </TickRate>
               <Section title="Speed">
                 <Slider label="Min speed" value={p.minSpeed} min={0} max={200} onChange={(v) => setParam('minSpeed', Math.min(v, p.maxSpeed))} unit=" px/s" />
                 <Slider label="Max speed" value={p.maxSpeed} min={10} max={400} onChange={(v) => setParam('maxSpeed', Math.max(v, p.minSpeed))} unit=" px/s" />
@@ -250,7 +267,7 @@ export default function ControlPanel({ params, setParam, stats, onReset, onNewMa
               </Section>
               <Section title="Depth cues" fold>
                 <Slider label="Deep fish fade and blur" value={p.deepFade} min={0} max={1} step={0.01} onChange={(v) => setParam('deepFade', v)} />
-                <Hint>Shallow fish cast a soft shadow on the floor, as dark as the plants' (Sky → Shadow darkness).</Hint>
+                <Hint>Shallow fish cast a soft shadow on the floor, as dark as the plants' (World → Weather → Shadow darkness).</Hint>
               </Section>
               <Section title="Steering limits" fold>
                 <Slider label="Max force" value={p.maxForce} min={10} max={1000} step={10} onChange={(v) => setParam('maxForce', v)} />
@@ -260,10 +277,15 @@ export default function ControlPanel({ params, setParam, stats, onReset, onNewMa
           )}
 
           {tab === 'Midges' && <MidgeTab params={p} setParam={setParam} stats={stats} actions={midgeActions} />}
-          {tab === 'Dragonflies' && <DragonflyTab params={p} setParam={setParam} stats={stats} actions={dragonflyActions} />}
 
           {tab === 'Pond' && (
             <>
+              <Section title="Water body">
+                <Slider label="Water depth" value={p.waterDepth} min={0.4} max={1.3} step={0.05} onChange={(v) => setParam('waterDepth', v)} unit="×" />
+                <Hint>Deeper or shallower water over the whole map; the shores stay put. Shallow water is where plants grow and the floor shows, deep water is dark and open.</Hint>
+                <Slider label="Land" value={p.landAmount} min={0} max={2} step={0.05} onChange={(v) => setParam('landAmount', v)} unit="×" />
+                <Hint>How much of the map is land: islands and wider shores, or open water out to the banks (the same map, its floor raised or lowered; plants and trunks are laid again).</Hint>
+              </Section>
               <Section title="Plants">
                 <Toggle label="Show plants, scum and pads" checked={p.showPlants} onChange={(v) => setParam('showPlants', v)} />
                 <Dial
@@ -286,6 +308,15 @@ export default function ControlPanel({ params, setParam, stats, onReset, onNewMa
                   knob="fill-lime-300 stroke-lime-100"
                   hand="stroke-lime-300/60"
                 />
+                <h4 className="pt-1 text-[11px] text-slate-400">Plant mix</h4>
+                {PLANT_KINDS.map((k) => {
+                  const key = plantAmountKey(k.name)
+                  return <Slider key={key} label={plantLabel(k.name)} value={p[key]} min={0} max={3} step={0.05} onChange={(v) => setParam(key, v)} unit="×" />
+                })}
+                <Hint>How much of each kind grows (the plants regrow when changed). The flowers of iris and pickerelweed feed the midges; the others give shade and shelter from the wind.</Hint>
+                <Slider label="Flower colour variation" value={p.flowerVariation} min={0} max={4} step={0.05} onChange={(v) => setParam('flowerVariation', v)} unit="×" />
+                <Hint>How far each plant's flower (and cattail spike) strays from its kind's colour, in hue, saturation and brightness (0 = all alike). Midges see the colour as drawn, so this changes what draws them too. Baked once per change, no cost per frame.</Hint>
+                <h4 className="pt-1 text-[11px] text-slate-400">Movement</h4>
                 <Slider label="Lean in the breeze" value={p.plantBreeze} min={0} max={4} step={0.1} onChange={(v) => setParam('plantBreeze', v)} />
                 <Slider label="Pushed by fish" value={p.plantBend} min={0} max={4} step={0.1} onChange={(v) => setParam('plantBend', v)} />
               </Section>
@@ -308,17 +339,19 @@ export default function ControlPanel({ params, setParam, stats, onReset, onNewMa
                 </button>
                 <Slider label="Plants cleared on land" value={p.logLandClearing} min={0} max={1} step={0.05} onChange={(v) => setParam('logLandClearing', v)} />
               </Section>
-              <Section title="Floor sludge">
-                <Slider label="Cover" value={p.sludgeAmount} min={0} max={1} step={0.01} onChange={(v) => setParam('sludgeAmount', v)} />
-                <Hint>Patches of rotting weed on the shallow to middle floor, fading into the murk.</Hint>
-              </Section>
-              <Section title="Floor details">
+              <Section title="Floor">
+                <Slider label="Sludge" value={p.sludgeAmount} min={0} max={1} step={0.01} onChange={(v) => setParam('sludgeAmount', v)} />
                 <Slider label="Leaf litter" value={p.floorLitter} min={0} max={1} step={0.01} onChange={(v) => setParam('floorLitter', v)} />
                 <Slider label="Pebbles" value={p.floorStones} min={0} max={1} step={0.01} onChange={(v) => setParam('floorStones', v)} />
                 <Slider label="Sunken twigs" value={p.floorTwigs} min={0} max={1} step={0.01} onChange={(v) => setParam('floorTwigs', v)} />
-                <Hint>Fallen leaves (thickest near the banks), pebble beds in the shallows, and waterlogged twigs, all fading into the murk with depth. Drawn once into the cached floor, so they cost nothing per frame (0 = none).</Hint>
+                <Hint>Rotting weed on the shallow to middle floor, fallen leaves (thickest near the banks), pebble beds in the shallows and waterlogged twigs, all fading into the murk with depth. Drawn once into the cached floor, so they cost nothing per frame (0 = none).</Hint>
               </Section>
-              <Section title="Pond scum">
+              <Section title="Scum and lily pads">
+                <Slider label="Scum" value={p.scumAmount} min={0} max={2} step={0.05} onChange={(v) => setParam('scumAmount', v)} unit="×" />
+                <Slider label="Scum among plants" value={p.scumAmongPlants} min={0} max={2} step={0.05} onChange={(v) => setParam('scumAmongPlants', v)} unit="×" />
+                <Slider label="Lily pads" value={p.padAmount} min={0} max={3} step={0.05} onChange={(v) => setParam('padAmount', v)} unit="×" />
+                <Hint>How far the duckweed mats spread over the shallows (and how far into the plants: 0 keeps them out, 1 as in open water, 2 crowds them in), and how many lily pad colonies grow (0 = none). Midges rest and lay on both.</Hint>
+                <h4 className="pt-1 text-[11px] text-slate-400">Scum movement</h4>
                 <Slider label="Pushed by fish" value={p.scumDrag} min={0} max={40} step={0.5} onChange={(v) => setParam('scumDrag', v)} />
                 <Slider label="Gaps close" value={p.scumCohesion} min={0} max={3} step={0.05} onChange={(v) => setParam('scumCohesion', v)} />
               </Section>
@@ -333,9 +366,14 @@ export default function ControlPanel({ params, setParam, stats, onReset, onNewMa
 
           {tab === 'Water' && (
             <>
+              <Section title="Colour">
+                <Slider label="Blue-green to brown" value={p.waterTint} min={0} max={1} step={0.01} onChange={(v) => setParam('waterTint', v)} />
+                <Hint>The water's colour away from the shallows: dark peaty blue-green, muddy brown, or between. Randomize world rolls it.</Hint>
+              </Section>
               <Section title="Murk">
                 <Slider label="Near the surface" value={p.murkSurface} min={0} max={1} step={0.01} onChange={(v) => setParam('murkSurface', v)} />
                 <Slider label="On the bottom" value={p.murkDeep} min={0} max={1} step={0.01} onChange={(v) => setParam('murkDeep', v)} />
+                <Slider label="Depth effect" value={p.depthEffect} min={0.5} max={3} step={0.05} onChange={(v) => setParam('depthEffect', v)} unit="×" />
                 <Slider label="On sunken trunks" value={p.logMurk} min={0.5} max={5} step={0.1} onChange={(v) => setParam('logMurk', v)} unit="×" />
               </Section>
               <Section title="Silt">
@@ -366,30 +404,51 @@ export default function ControlPanel({ params, setParam, stats, onReset, onNewMa
             </>
           )}
 
-          {tab === 'Sky' && (
+          {tab === 'Weather' && (
             <>
               <Section title="Sun">
                 <Dial label="Sun direction" value={p.sunAzimuth} onChange={(v) => setParam('sunAzimuth', v)} />
                 <Slider label="Sun height" value={p.sunElevation} min={10} max={80} onChange={(v) => setParam('sunElevation', v)} unit="°" />
+                <Slider label="Sunlight" value={p.sunBrightness} min={0.5} max={2} step={0.05} onChange={(v) => setParam('sunBrightness', v)} unit="×" />
+                <Hint>The higher the sun, the brighter and whiter the light; a low sun is dimmer and warmer, with longer shadows. Sunlight scales it all.</Hint>
                 <Slider label="Shadow darkness" value={p.shadowDarkness} min={0} max={0.9} step={0.01} onChange={(v) => setParam('shadowDarkness', v)} />
               </Section>
               <Section title="Wind and clouds">
+                <Toggle label="Wind changes by itself" checked={p.windAuto} onChange={(v) => {
+                  // Taken over by hand: it keeps blowing as it was.
+                  if (!v && stats.wind) {
+                    setParam('windDirection', Math.round(stats.wind.direction))
+                    setParam('cloudSpeed', Math.round(stats.wind.speed))
+                  }
+                  setParam('windAuto', v)
+                }} />
+                {/* In auto the dials follow the wind as it blows; turning one takes the wind over by hand. */}
                 <Dial
-                  label="Wind direction"
-                  value={p.windDirection}
-                  onChange={(v) => setParam('windDirection', v)}
+                  label={p.windAuto ? 'Wind direction (now)' : 'Wind direction'}
+                  value={p.windAuto && stats.wind ? stats.wind.direction : p.windDirection}
+                  onChange={(v) => (setParam('windAuto', false), setParam('windDirection', v))}
                   knob="fill-sky-300 stroke-sky-100"
                   hand="stroke-sky-300/60"
                 />
                 <Dial
-                  label="Wind speed"
-                  value={p.cloudSpeed}
-                  onChange={(v) => setParam('cloudSpeed', v)}
+                  label={p.windAuto ? 'Wind speed (now)' : 'Wind speed'}
+                  value={p.windAuto && stats.wind ? stats.wind.speed : p.cloudSpeed}
+                  onChange={(v) => (setParam('windAuto', false), setParam('cloudSpeed', v))}
                   range={[0, 80]}
                   unit=" px/s"
                   knob="fill-sky-300 stroke-sky-100"
                   hand="stroke-sky-300/60"
                 />
+                {p.windAuto ? (
+                  <>
+                    <Slider label="Average speed" value={p.cloudSpeed} min={0} max={80} onChange={(v) => setParam('cloudSpeed', v)} unit=" px/s" />
+                    <Slider label="How much it changes" value={p.windVariability} min={0} max={1} step={0.05} onChange={(v) => setParam('windVariability', v)} />
+                    <Slider label="Changes every" value={p.windChangeEvery} min={5} max={300} step={5} onChange={(v) => setParam('windChangeEvery', v)} unit=" s" />
+                    <Hint>The wind turns and gusts by itself, settling on a new direction and strength every so often and easing there; the dials show it as it blows. Turn a dial to set the wind by hand.</Hint>
+                  </>
+                ) : (
+                  <Hint>The wind blows exactly as the dials set it. Switch on the toggle to let it change by itself.</Hint>
+                )}
                 <Toggle label="Clouds" checked={p.showClouds} onChange={(v) => setParam('showClouds', v)} />
                 <Slider label="Cloud cover" value={p.cloudCover} min={0} max={1} step={0.01} onChange={(v) => setParam('cloudCover', v)} />
               </Section>
@@ -408,18 +467,6 @@ export default function ControlPanel({ params, setParam, stats, onReset, onNewMa
           {tab === 'View' && (
             <>
               <Section title="Overlays">
-                <div className="space-y-1">
-                  <span className="text-xs text-slate-300">Vision range</span>
-                  <Segmented
-                    value={p.visionMode}
-                    onChange={(v) => setParam('visionMode', v)}
-                    options={[
-                      { value: 'all', label: 'All' },
-                      { value: 'selected', label: 'Selected' },
-                      { value: 'off', label: 'Off' },
-                    ]}
-                  />
-                </div>
                 <Toggle label="Insect motion trails" checked={p.insectTrails} onChange={(v) => setParam('insectTrails', v)} />
                 <Toggle label="Velocity vector" checked={p.showVelocity} onChange={(v) => setParam('showVelocity', v)} swatch="bg-gradient-to-r from-sky-400 to-amber-400" />
                 <Toggle label="Steering vector" checked={p.showSteering} onChange={(v) => setParam('showSteering', v)} swatch="bg-gradient-to-r from-purple-500 to-pink-500" />
@@ -437,9 +484,16 @@ export default function ControlPanel({ params, setParam, stats, onReset, onNewMa
             </>
           )}
 
-          <p className="text-[11px] leading-relaxed text-slate-500">
-            Click a boid to inspect it. Arrow length = magnitude, colour shifts from cool to warm as it nears the max.
-          </p>
+          <footer className="space-y-2 border-t border-slate-700/60 pt-3">
+            <p className="text-[11px] leading-relaxed text-slate-500">Click a fish or midge to inspect it.</p>
+            <button
+              type="button"
+              onClick={() => window.confirm('Reset every setting to its default? The creatures and the map stay.') && onDefaults()}
+              className="text-[11px] text-slate-500 underline-offset-2 hover:text-slate-300 hover:underline"
+            >
+              Reset all settings
+            </button>
+          </footer>
         </div>
       )}
     </aside>

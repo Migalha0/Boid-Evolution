@@ -2,7 +2,8 @@ import { useCallback, useMemo, useRef, useState } from 'react'
 import BoidCanvas from './components/BoidCanvas.jsx'
 import ControlPanel from './components/ControlPanel.jsx'
 import PopulationDrawer from './components/PopulationDrawer.jsx'
-import { DEFAULT_PARAMS, randomMurk } from './config/defaults.js'
+import { DEFAULT_PARAMS } from './config/defaults.js'
+import { randomMurk, randomWorld } from './config/world.js'
 
 export default function App() {
   const [params, setParams] = useState(DEFAULT_PARAMS)
@@ -11,34 +12,19 @@ export default function App() {
 
   const setParam = useCallback((key, value) => setParams((p) => ({ ...p, [key]: value })), [])
 
-  const handleSelect = useCallback(
-    (index) => {
-      // Auto-switch to "selected" vision only if the user had vision off.
-      if (index >= 0) setParams((p) => (p.visionMode === 'off' ? { ...p, visionMode: 'selected' } : p))
-    },
-    [],
-  )
-
   const midgeActions = useMemo(
     () => ({
       restart: (profile) => canvasRef.current?.restartMidges(profile),
+      clear: () => canvasRef.current?.clearMidges(),
       apply: (profile) => canvasRef.current?.applyMidgeProfile(profile),
       population: () => canvasRef.current?.midgePopulation() ?? null,
-    }),
-    [],
-  )
-  const dragonflyActions = useMemo(
-    () => ({
-      restart: (profile) => canvasRef.current?.restartDragonflies(profile),
-      apply: (profile) => canvasRef.current?.applyDragonflyProfile(profile),
-      population: () => canvasRef.current?.dragonflyPopulation() ?? null,
     }),
     [],
   )
 
   return (
     <main className="relative h-full w-full overflow-hidden bg-slate-950">
-      <BoidCanvas ref={canvasRef} params={params} onStats={setStats} onSelect={handleSelect} />
+      <BoidCanvas ref={canvasRef} params={params} onStats={setStats} />
       <PopulationDrawer history={stats.history} />
       <ControlPanel
         params={params}
@@ -49,10 +35,10 @@ export default function App() {
           canvasRef.current?.newMap()
           setParams((p) => ({ ...p, ...randomMurk() }))
         }}
+        onRandomizeWorld={() => setParams((p) => ({ ...p, ...randomWorld() }))}
         onShuffleLogs={() => canvasRef.current?.shuffleLogs()}
         onDefaults={() => setParams(DEFAULT_PARAMS)}
         midgeActions={midgeActions}
-        dragonflyActions={dragonflyActions}
       />
     </main>
   )

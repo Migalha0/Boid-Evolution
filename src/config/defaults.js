@@ -28,7 +28,8 @@ export const DEFAULT_PARAMS = {
 
   // Light: shadows fall away from the sun
   sunAzimuth: 322, // degrees, clockwise from north (screen up)
-  sunElevation: 31, // degrees above the horizon; lower = longer shadows
+  sunElevation: 31, // degrees above the horizon; lower = longer shadows, dimmer and warmer light
+  sunBrightness: 1.25, // overall sunlight (the sun's height scales it further)
   shadowDarkness: 0.4, // fraction of light a shadow blocks
   plantSelfShadow: 0.18, // how much shaded plant bases darken (tops stay sunlit)
   floatHeight: 4, // px the floating scum (and, lower, the lily pads) sits above its shadow
@@ -37,6 +38,9 @@ export const DEFAULT_PARAMS = {
   showClouds: true, // drifting cloud shadows over the whole scene
   windDirection: 60, // degrees the wind blows towards, clockwise from north (screen up)
   cloudSpeed: 14, // px/s the cloud shadows drift with the wind; also how lively the ripples are
+  windAuto: true, // the wind changes by itself (else it blows exactly as set)
+  windVariability: 0.4, // auto wind: 0 = steady; up to 1, each change turns it up to ±90°, speed 0..2x the set speed
+  windChangeEvery: 40, // seconds (on average) between the wind settling on a new direction and strength
   cloudCover: 0.45, // 0 = clear sky .. 1 = overcast
   cloudSize: 1400, // world px per cloud noise tile
   cloudSoftness: 0.1, // width of the wispy cloud edges
@@ -46,6 +50,7 @@ export const DEFAULT_PARAMS = {
   showWaterMotion: true, // deep-water swirl, shallow caustics and ripples
   murkSurface: 0.18, // how much a fish right below the surface fades into the water
   murkDeep: 0.88, // ... and one on the deepest bottom
+  depthEffect: 1.6, // how strongly depth shows: 1 = as the murk says; higher, everything fades and darkens sooner with depth
   swirlStrength: 0.07, // brightness change of the deep-water silt swirl
   swirlSize: 900, // world px per swirl noise tile
   swirlSpeed: 0.004, // noise tiles per second the eddies turn over
@@ -72,6 +77,9 @@ export const DEFAULT_PARAMS = {
   logCount: 4, // fallen tree trunks, from the banks into the water
   logLandClearing: 0.3, // 0 = land plants ignore trunks .. 1 = bent fully clear of them
   logMurk: 2.5, // how quickly submerged trunks fade into the murk with depth
+  waterTint: 0, // water colour in the middle and deep: 0 = peaty blue-green, 1 = muddy brown
+  waterDepth: 1, // how deep the water is, as a multiple of the generated depth (the shore stays put)
+  landAmount: 1, // how much of the map is land: 0 = open water to the banks, 1 = as generated, 2 = mostly land
   plantDeepSparseness: 0.6, // 0 = even growth .. 1 = no plants at the deep edge of the plant zone
   sludgeAmount: 0.5, // how much of the shallow-mid floor is covered in sludge
   // Floor details (0 = none; drawn into the cached floor, so free per frame)
@@ -79,29 +87,25 @@ export const DEFAULT_PARAMS = {
   floorStones: 0.4, // pebble beds in the shallows
   floorTwigs: 0.3, // sunken twigs and branches
   showInsects: true,
-  insectTrails: true, // fading motion trails behind flying midges and dragonflies (they show when fast-forwarding)
-  // Midges: how each one behaves is in its genes (sim/Insects.js GENES); these are the world they live in.
-  insectCount: Infinity, // most midges alive at once (Infinity: no limit, so food decides)
-  insectStart: 100, // midges per spawn (random genomes, or the profile's); nothing spawns by itself
+  insectTrails: true, // fading motion trails behind flying midges (they show when fast-forwarding)
+  // Midges: how each one flies is in its genes (species/midges.js MIDGE_GENES); these are the world they live in.
+  insectStart: 100, // midges per spawn (random genomes, or the profile's); nothing spawns or is born by itself
+  midgeVisionMode: 'selected', // midges' vision rings: 'all' | 'selected' | 'off'
+  midgeLookEvery: 4, // midge tick rate: steps between looks at midges, flowers, scum and pads (taking turns)
   insectWind: 1, // how far the wind carries them
-  insectBodyTime: 12, // seconds a body lies before it is gone
   insectHunger: 0.03, // energy a midge burns per second flying at 70 px/s (full = 1)
+  insectBodyTime: 12, // seconds a dead midge's body lies before it is gone
+  midgeLifespan: 120, // seconds from hatching before a midge ages
+  midgeAgeSlow: 0.97, // past its lifespan, a midge's speeds x this every second
+  midgeAgeBurn: 1.03, // past its lifespan, a midge's energy burn x this every second
+  eggHatchTime: 15, // seconds a midge egg on the scum takes to hatch
   flowerNectar: 1, // meals (full energy) a flower holds
   flowerRegrow: 50, // seconds a drunk-dry flower takes to refill
   flowerRefills: 6, // refills before a flower wilts and rests (0 = never), varied per flower
   flowerDormancy: 100, // seconds a wilted flower rests before refilling, varied per flower
-  // Dragonflies: an evolving predator population (their behaviour is in their genes)
-  showDragonflies: true,
-  dragonflyMutationRate: 0.1, // chance each gene mutates in a newly emerged dragonfly
-  dragonflyMutationSize: 0.08, // typical mutation, as a fraction of the gene's range
-  dragonflyProfile: null, // the chosen dragonfly profile, if any
-  dragonflyLocked: false, // every dragonfly carries the profile's genome exactly, no mutations
-  dragonflyCap: Infinity, // most dragonflies alive at once (Infinity: no limit)
-  dragonflyStart: 6, // dragonflies per spawn (random genes, or the profile's); nothing spawns by itself
-  dragonflyHunger: 0.025, // energy a dragonfly burns per second flying at 130 px/s
-  dragonflyMeal: 0.38, // energy a dragonfly gets from a midge (scaled by its digestion gene)
   mutationRate: 0.1, // chance each gene mutates in a hatchling
   mutationSize: 0.08, // typical mutation, as a fraction of the gene's range
+  mutationFlip: 0.05, // chance a mutation flips the gene's sign instead
   midgeProfile: null, // the chosen profile ({ name, genes, ... }), if any
   midgeLocked: false, // every midge carries the profile's genome exactly, no mutations
   // How much of each plant kind grows (1 = as generated, 0 = none)
@@ -111,17 +115,22 @@ export const DEFAULT_PARAMS = {
   plantIris: 1, // yellow flowers (midge food)
   plantShrub: 1,
   plantPickerelweed: 1, // purple flowers (midge food)
+  flowerVariation: 1.5, // how far each plant's flower (and cattail spike) strays from its kind's colour (0 = all alike)
   plantShallowDensity: 0.5, // share of the shallowest water and shore fringe that is planted (rest: open gaps)
   wakeRadius: 16, // px of water a swimming fish disturbs
   wakeStrength: 10, // how hard fish push the water
   wakeFade: 3, // rate (1/s) the disturbance settles
+  scumAmount: 1, // how much duckweed scum covers the shallows (0 = none, 1 = as generated)
+  scumAmongPlants: 0.5, // scum among the plants: 0 = none, 1 = as much as in open shallows, 2 = crowding into them
+  padAmount: 1, // how many lily pad colonies grow (0 = none, 1 = as generated)
   scumDrag: 12, // how far fish shove the scum fronds
   scumCohesion: 0.3, // rate (1/s) neighbouring fronds drift together, closing gaps
 
   // Visualisation
   boidSize: 6,
   pixelSize: 1, // CSS px per rendered pixel (1 = full resolution)
-  visionMode: 'off', // 'all' | 'selected' | 'off'
+  fishVisionMode: 'selected', // fish range rings: 'all' | 'selected' | 'off'
+  fishLookEvery: 1, // fish tick rate: steps between looks at the shoal (taking turns)
   showVelocity: false,
   showSteering: false,
   showPlants: true, // reeds, cattails, iris, shrubs and lily pads (display only)
@@ -130,13 +139,4 @@ export const DEFAULT_PARAMS = {
   colorLevels: 24, // colour levels per channel (lo-fi palette depth)
   dithering: true, // ordered (Bayer) dithering between colour levels
   vignette: 0.45, // darkening towards the corners
-}
-
-/**
- * Murk for a new map: every pond's water is a little different, from clearer
- * to murkier (ranges kept around the defaults so it always reads as a pond).
- */
-export function randomMurk() {
-  const r = (a, b) => Math.round((a + Math.random() * (b - a)) * 100) / 100
-  return { murkSurface: r(0.05, 0.35), murkDeep: r(0.65, 0.97), logMurk: Math.round(r(1.5, 4) * 10) / 10 }
 }

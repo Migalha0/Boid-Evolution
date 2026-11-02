@@ -7,6 +7,8 @@ export const ELEV_CELL = 6
 export const SDF_CELL = 3
 /** Elevation above which the floor breaks the surface and becomes land. */
 export const LAND_LEVEL = 0.8
+/** px per cell of the plants' colour-region grid (PondMap.tint). */
+export const TINT_CELL = 8
 /** Elevation where aquatic vegetation starts to appear. */
 const VEG_START = 0.5
 /**
@@ -15,8 +17,8 @@ const VEG_START = 0.5
  * a narrow fringe along the bank grows thick, so the bank's edge never shows.
  */
 const WATER_COVER = 0.45
-/** Field label for reed beds in the water (behaviour hook, neutral for now). */
-export const REEDS = 1
+/** Reed beds are judged on a grid of cells this size (px). */
+const REED_CELL = 8
 
 /**
  * The pond map, generated from a seed (resizing regenerates the same map).
@@ -37,8 +39,7 @@ export const REEDS = 1
  *    a trunk grow away from it (on land only partly, see landClearing).
  */
 export class PondMap {
-  constructor(field) {
-    this.field = field
+  constructor() {
     this.vegetation = new Vegetation()
     this.seed = newSeed()
     this.width = 0
@@ -61,6 +62,10 @@ export class PondMap {
     this.logVersion = 0
     /** How much of each plant kind grows (by PLANT index): 0 = none, 1 = as generated, 2 = twice as many. */
     this.kindAmounts = PLANT_KINDS.map(() => 1)
+    /** How deep the water is, as a multiple of the generated depth (the shore stays where it is). */
+    this.waterDepth = 1
+    /** How much of the map is land: 0 = open water to the banks, 1 = as generated, 2 = mostly land. */
+    this.landAmount = 1
   }
 
   layout(width, height) {
@@ -70,8 +75,11 @@ export class PondMap {
     this.generate()
   }
 
-  newMap() {
+  /** A new map (at a new size, if given). */
+  newMap(width = this.width, height = this.height) {
     this.seed = newSeed()
+    this.width = width
+    this.height = height
     this.generate()
   }
 
@@ -82,6 +90,20 @@ export class PondMap {
     this.generateLogs()
     this.generateVegetation()
     this.version++
+  }
+
+  /** The same map with the water at a new depth: floor, plants and trunks are laid again. */
+  setWaterDepth(depth) {
+    if (depth === this.waterDepth) return
+    this.waterDepth = depth
+    if (this.width) this.generate()
+  }
+
+  /** The same map with more or less land (the floor raised or lowered under the same surface). */
+  setLandAmount(amount) {
+    if (amount === this.landAmount) return
+    this.landAmount = amount
+    if (this.width) this.generate()
   }
 
   /** Regrow the plants alone (same floor and shore), e.g. after a sparseness change. */
@@ -162,6 +184,7 @@ export class PondMap {
         max = Math.max(max, v)
       }
     }
+    const shore = Math.min(0.99, Math.max(0.3, LAND_LEVEL + (1 - this.landAmount) * 0.2))
     for (let j = 0; j < rows; j++) {
       for (let i = 0; i < cols; i++) {
         const k = j * cols + i
@@ -170,7 +193,14 @@ export class PondMap {
         // Raised banks along the border, with a noisy width -> squiggly shore.
         const edge = Math.min(x, y, W - x, H - y)
         const bank = 2 + 17 * smoothstep(0.3, 0.7, fbm(noise, x * 0.012 + 31.7, y * 0.012 + 11.3))
-        e[k] = Math.min(1, (e[k] - min) / (max - min || 1) + 0.95 * (1 - smoothstep(0, bank, edge)))
+        // More or less land: the shore moves to `shore` on the noise, and the
+        // range below and above it is stretched back to water and land.
+        const v = (e[k] - min) / (max - min || 1)
+        const lifted = v < shore ? (v / shore) * LAND_LEVEL : LAND_LEVEL + ((v - shore) / (1 - shore)) * (1 - LAND_LEVEL)
+        e[k] = Math.min(1, lifted + 0.95 * (1 - smoothstep(0, bank, edge)))
+        // Deeper or shallower water: the floor scaled away from the surface,
+        // land untouched (a floor deeper than the deepest flattens out).
+        if (e[k] < LAND_LEVEL) e[k] = Math.max(0, LAND_LEVEL - (LAND_LEVEL - e[k]) * this.waterDepth)
       }
     }
     this.cols = cols
@@ -215,8 +245,22 @@ export class PondMap {
     // green, blending smoothly, plus a little per-plant jitter.
     const tones = makeNoise(rand)
     const jitter = (v) => Math.max(0, Math.min(1, v + (rand() - 0.5) * 0.2))
-    const brown = (x, y) => jitter(smoothstep(0.48, 0.66, fbm(tones, x * 0.0035, y * 0.0035)))
-    const yellow = (x, y) => jitter(smoothstep(0.48, 0.66, fbm(tones, x * 0.0035 + 91.7, y * 0.0035 + 23.1)))
+    const brownAt = (x, y) => smoothstep(0.48, 0.66, fbm(tones, x * 0.0035, y * 0.0035))
+    const yellowAt = (x, y) => smoothstep(0.48, 0.66, fbm(tones, x * 0.0035 + 91.7, y * 0.0035 + 23.1))
+    const brown = (x, y) => jitter(brownAt(x, y))
+    const yellow = (x, y) => jitter(yellowAt(x, y))
+    // The same regions as a coarse grid (brown, yellow per TINT_CELL px), so
+    // the soil can take the tint of the plants growing there.
+    const tc = Math.ceil(this.width / TINT_CELL) + 1
+    const tr = Math.ceil(this.height / TINT_CELL) + 1
+    const tint = new Uint8Array(tc * tr * 2)
+    for (let j = 0; j < tr; j++) {
+      for (let i = 0; i < tc; i++) {
+        tint[(j * tc + i) * 2] = Math.round(255 * brownAt(i * TINT_CELL, j * TINT_CELL))
+        tint[(j * tc + i) * 2 + 1] = Math.round(255 * yellowAt(i * TINT_CELL, j * TINT_CELL))
+      }
+    }
+    this.tint = { cols: tc, rows: tr, data: tint }
     const claimAt = this.makeClaims(rand, noise)
     // Open water in the shallows: irregular gaps where a noise field is below
     // the level that leaves shallowDensity of the area planted (the noise is
@@ -299,11 +343,18 @@ export class PondMap {
           const fits = Math.max(0, near.gap) / k.length[1] / forward
           scale = Math.min(scale, scale + (fits - scale) * clear)
           if (scale < 0.3) {
-            if (!land) return
+            // Too cramped to grow: in the water never, on land as often as the
+            // clearing says (a position hash, not the random stream, so the
+            // rest of the layout stays put); the rest stay as stubs.
+            if (!land || cellHash(x, y) < clear) return
             scale = 0.3
           }
         }
       }
+      // Nothing grows off screen (the world's margin round the view): no
+      // flowers or shelter out there to draw midges out of view. Checked
+      // last, so the random stream and the rest of the layout stay as they were.
+      if (this.insideView(x, y) < 0) return
       veg.add(kind, x, y, scale, rot, seed, br, ye, land)
     }
     for (let gy = 0; gy * G < this.height; gy++) {
@@ -337,20 +388,6 @@ export class PondMap {
       }
     }
 
-    // Reed beds as a region type, so behaviours can be attached later.
-    const field = this.field
-    field.clear()
-    field.defineBehavior(REEDS, { name: 'reeds', vegetation: true, color: [0, 0, 0, 0] })
-    const cs = field.cellSize
-    for (let j = 0; j < field.rows; j++) {
-      for (let i = 0; i < field.cols; i++) {
-        const x = (i + 0.5) * cs
-        const y = (j + 0.5) * cs
-        const d = this.distanceAt(x, y)
-        field.labels[j * field.cols + i] = d >= 0 && this.shallowness(x, y, d) > 0.45 ? REEDS : 0
-      }
-    }
-    field.recount()
   }
 
   /**
@@ -393,6 +430,17 @@ export class PondMap {
     }
   }
 
+  /** Whether (x, y) is in a reed bed: its grid cell's centre is water this vegetated. */
+  inReeds(x, y) {
+    const i = Math.floor(x / REED_CELL)
+    const j = Math.floor(y / REED_CELL)
+    if (i < 0 || j < 0 || i >= Math.ceil(this.width / REED_CELL) || j >= Math.ceil(this.height / REED_CELL)) return false
+    const cx = (i + 0.5) * REED_CELL
+    const cy = (j + 0.5) * REED_CELL
+    const d = this.distanceAt(cx, cy)
+    return d >= 0 && this.shallowness(cx, cy, d) > 0.45
+  }
+
   /** 0..1, how vegetated a water spot is: shallow floor or close to shore. */
   shallowness(x, y, d = this.distanceAt(x, y)) {
     return Math.max(smoothstep(VEG_START, LAND_LEVEL, this.elevationAt(x, y)), 1 - smoothstep(0, 45, d))
@@ -420,6 +468,12 @@ export class PondMap {
   }
 
   /** Random point in open water at least `margin` px from the shore, inside the view if set. */
+  /** How far (x, y) is inside the visible part of the map (px; negative off screen). */
+  insideView(x, y) {
+    const [vx, vy, vw, vh] = this.view ?? [0, 0, this.width, this.height]
+    return Math.min(x - vx, y - vy, vx + vw - x, vy + vh - y)
+  }
+
   randomPoint(margin = 20) {
     const [vx, vy, vw, vh] = this.view ?? [0, 0, this.width, this.height]
     for (let i = 0; i < 1000; i++) {
@@ -530,6 +584,12 @@ function smoothstep(a, b, x) {
 
 function newSeed() {
   return (Math.random() * 2 ** 32) >>> 0
+}
+
+/** 0..1, fixed for a position. */
+function cellHash(x, y) {
+  const v = Math.sin(x * 12.9898 + y * 78.233) * 43758.5453
+  return v - Math.floor(v)
 }
 
 function mulberry32(seed) {

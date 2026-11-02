@@ -105,3 +105,53 @@ export function Toggle({ label, checked, onChange, swatch }) {
     </label>
   )
 }
+
+/** One of a few options, as a row of buttons. */
+export function Segmented({ value, options, onChange }) {
+  return (
+    <div className="grid grid-cols-3 gap-1 rounded-md bg-slate-800/80 p-0.5">
+      {options.map((o) => (
+        <button
+          key={o.value}
+          type="button"
+          onClick={() => onChange(o.value)}
+          className={`rounded px-2 py-1 text-xs transition-colors ${
+            value === o.value ? 'bg-sky-500/90 text-white' : 'text-slate-300 hover:bg-slate-700'
+          }`}
+        >
+          {o.label}
+        </button>
+      ))}
+    </div>
+  )
+}
+
+/** A species' range rings: every one, only the selected one, or none (the same control on each species' tab). */
+export function RangeModes({ label = 'Vision range', value, onChange }) {
+  return (
+    <div className="space-y-1">
+      <span className="text-xs text-slate-300">{label}</span>
+      <Segmented
+        value={value}
+        onChange={onChange}
+        options={[
+          { value: 'all', label: 'All' },
+          { value: 'selected', label: 'Selected' },
+          { value: 'off', label: 'Off' },
+        ]}
+      />
+    </div>
+  )
+}
+
+/** A species' tick rate: steps between looks around (the same control on each species' tab). */
+export function TickRate({ value, onChange, children }) {
+  return (
+    <Section title="Tick rate">
+      <Slider label="Looks around every" value={value} min={1} max={12} onChange={onChange} unit={value === 1 ? ' step' : ' steps'} />
+      <Hint>
+        {children} They take turns, so each step only a share of them looks; the rest steer by what they saw last. Slower ticks cost less and react later.
+      </Hint>
+    </Section>
+  )
+}

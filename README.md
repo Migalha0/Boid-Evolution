@@ -1,6 +1,6 @@
 # Boid Evolution
 
-A pond ecosystem simulated in the browser, built to keep changing over time instead of settling into one steady state. Fish, midges and dragonflies live in a pond that is drawn from scratch for every new map. They eat, breed, die, and pass their traits on with small mutations.
+A pond ecosystem simulated in the browser, built to keep changing over time instead of settling into one steady state. Fish and midges live in a pond that is drawn from scratch for every new map. Every creature runs on the GPU through one shared base boid, so new species and behaviours plug into the same machinery.
 
 ![A pond with schools of koi among plants, logs and lily pads, with the control panel on the right](docs/screenshot.png)
 
@@ -11,7 +11,7 @@ A pond ecosystem simulated in the browser, built to keep changing over time inst
 Most boid demos fix their rules and tune them by hand. Here, as little as possible is scripted:
 
 - **Behaviour emerges.** Schools, swarms, colonies and territories aren't programmed as groups. They come out of each individual's own rules and genes, and survive only if they help it feed and breed.
-- **Traits evolve.** Each creature carries its own genome. Offspring inherit their mother's genome with mutations, and selection keeps whatever works in the current pond.
+- **Traits evolve.** Each creature carries its own genome. Offspring inherit their mother's genome with mutations (now and then a mutation flips a gene's sign, so every gene also has a meaning when negative), and selection keeps whatever works in the current pond.
 - **The world keeps changing.** Flowers drain and refill on their own cycles, clouds and plant shade move, predators rise and crash after their prey, and every new map has a different layout. No strategy stays best forever.
 
 ## What's in the pond
@@ -27,24 +27,29 @@ Most boid demos fix their rules and tune them by hand. Here, as little as possib
 
 ### Midges
 
-- Small flies that dance over flowers and scum mats, simulated on the CPU.
-- They burn energy flying (more the faster they fly), drink nectar from flowers, and lay egg rafts on the water only when well fed.
-- Their genes cover speed, search range, hunger, swarming, landing and resting, flower and scum preferences, shade, cohesion and separation, vigilance, sun-shyness, laying, brood size, lifespan and hatching time.
-- Lifespan and hatching time are trades: long-lived midges breed later, and quick eggs give weaker hatchlings while slow ones are lost more often.
-- Energy is conserved: each egg carries energy from its mother, so all of it comes from nectar.
+- Small flies, boids on the GPU (tens of thousands run comfortably). A midge sees everything within its vision gene: other midges, flowers, scum and lily pads.
+- Each thing it recognises pulls or pushes it by a gene of its own. Other midges act through cohesion, alignment and separation (1/distance², like personal space). Every other item has a signed weight, + to approach and − to avoid, so evolution decides. Flowers only pull as hard as the midge is hungry.
+- A midge knows flowers only by their colour as drawn. Colour genes (red, green, blue) and a tolerance gene set which flowers draw it. Each flower's colour strays a little from its kind's, and it fades towards withered as it is drunk dry, so how full it looks is the cue. Only touching one tells whether it is open.
+- Speed genes set its cruise speed (its own propulsion) and its min and max speed.
+- Flying burns energy, more the faster. A hungry midge that touches a flower with nectar stops on it and drinks. It leaves after its eat-time gene's seconds, when the flower runs dry, or when its flock or the things it senses pull hard enough.
+- With energy above its laying gene, scum draws it, and the further above, the harder. Touching scum, it lays an egg there, which costs 30% of its energy. The egg hatches after a set time (the Midges tab, World section) into a midge with a mutated copy of its genome.
+- Past the lifespan (a slider), every second it gets slower and burns more energy, each by a multiplier you set, until it starves of old age. Otherwise it dies when its energy runs out. What selects is how many eggs a midge lays before then.
+- Laying an egg on the water, or falling there dead, sends out a small round ripple.
 
 ### Dragonflies
 
-- A separate species that hunts the midges. Their numbers follow the midges' with a delay.
-- Their genes cover speed, agility, sight, chase patience, digestion time (fast and lean against slow and thorough), swarm confusion (steady in a swarm against sight), ambush against patrol, territoriality, perching, laying, brood size, lifespan, egg emergence time, and an inherited body colour that shows lineages.
-- They are cold-blooded, so they are slower in the shade. They also miss more often when the midge they strike at is in a dense swarm.
+Removed for now: they will be remade on the shared base boid.
 
 ### The world
 
 - Each map is laid out from scratch: banks, islands, logs, and several kinds of plant spread across land, shallows and deeper water.
-- Nectar-bearing flowers (iris and pickerelweed) fade as they are drunk. Each one refills, and rests now and then on its own cycle.
-- Lily pads, drifting scum, silt, and a cached floor of leaf litter, pebbles and sunken twigs.
-- Sun and moving cloud shadows (which the creatures react to), wind, ripples, caustics and refraction.
+- Lily pads, drifting scum, silt, and a cached floor of leaf litter, pebbles and sunken twigs, lit by the sun and casting small shadows.
+- Fallen trunks in a range of colours, some birch-like; they carry lichen (more near the water), algae at the waterline, and now and then shelf fungi on their drier stretches. Their colours are baked once per trunk layout.
+- Lily colonies come in pink, white or yellow, with open blooms and buds.
+- The Pond tab sets how much of the map is land (same map, floor raised or lowered), the water depth, and how far the scum spreads, including how far it creeps in among the plants.
+- Sun and moving cloud shadows (which the creatures react to), wind (it wanders around the set direction and speed, changing gradually every so often), ripples, caustics and refraction.
+- Resizing the window keeps the world while it still fits (only the view is cropped), so a fullscreen browser showing its toolbar does not reset the pond. A bigger window lays it out again.
+- **New map** lays out new shores and a new floor. **Randomize world** keeps the map's shape but rerolls its conditions: the plant mix, water depth, colour (peaty blue-green to muddy brown) and murk, trunks, floor details, sun, wind and clouds. Varying the world is how the creatures are kept from fitting one pond.
 
 ## Running it
 
@@ -59,41 +64,46 @@ A WebGL2-capable browser is required.
 Nothing spawns by itself: the pond starts empty.
 - **Fish:** use the Count slider in the Fish tab.
 - **Midges:** use *Spawn random flock* in the Midges tab.
-- **Dragonflies:** use *Spawn random dragonflies* in the Dragonflies tab. They need midges to eat.
 
-The sim speed slider at the top fast-forwards the whole world. Hover over the tab at the bottom of the screen to see every population on one graph.
+The panel's tabs come in two groups: **Creatures** (Fish, Midges) and **World** (Pond, Water, Weather, View). Next to *Play* / *Pause*, the sim speed slider fast-forwards the whole world. Click a fish or midge to inspect it: its range, what it sees and an arrow per force acting on it (Escape deselects). Hover over the tab at the bottom of the screen to see every population on one graph.
 
 ## Training and profiles
 
-Evolution can run in the app or headless, much faster than real time:
-
-```bash
-npm run train -- --minutes 120 --maps 6 --out profiles/run1.json
-npm run train -- --from profiles/run1.json --dragon-from profiles/run1-dragonflies.json   # continue
-npm run train -- showDragonflies=0 insectHunger=0.02                                       # change world params
-```
-
-Each run writes one profile per species: the mean genome of the population, plus the world it was trained in.
+Evolution runs in the app: raise the sim speed at the top of the panel to fast-forward. (Headless training is gone for now, since the simulation runs on the GPU.)
 
 In the app, each species' tab can:
-- save, import and export profiles (each species has its own format);
-- spawn a population from a profile;
+- save a profile of either the **population average** (tagged *avg*) or the **selected individual's exact genes** (tagged *one*);
+- import and export profiles (each species has its own format);
+- spawn a population from a profile, or give it to everyone alive;
 - lock everyone to a profile, so behaviour stops changing.
-
-Headless training has no scum and no shade, so the genes tied to those are only shaped in the app.
 
 ## Project layout
 
 ```
 src/
-  gpu/         GPU fish simulation and GPU fields (scum, silt, sway)
-  render/      WebGL2 renderer and shaders (water, plants, insects, clouds)
-  sim/         CPU simulation: map, plants, lily pads, logs, midges, dragonflies, genetics, profiles
-  engine/      Engine: owns the world, steps the sims, feeds the renderer
+  gpu/boids/   the GPU base boid (BoidKernel), its shader generator (codegen) and item sources
+  gpu/         the pond on the GPU (nectar, items, shelter: PondGpu) and GPU fields (scum, silt, sway)
+  species/     species definitions: genes, senses, forces and behaviour (fish, midges)
+  render/      WebGL2 renderer and shaders (water, plants, creatures, clouds, focus overlay)
+  sim/         CPU-side world: map, plants, lily pads, logs, genetics, profiles
+  engine/      Engine: owns the world, steps the species, feeds the renderer
   components/  React UI: control panel, species tabs, population drawer
-  config/      Default parameters
-scripts/
-  train.mjs    Headless training
+  config/      Default parameters and the world randomizer
 ```
 
 Built with Vite, React 18, Tailwind CSS v4 and raw WebGL2.
+
+## Adding a species
+
+A species is one definition file in `src/species/` that the GPU base boid (`src/gpu/boids/BoidKernel.js`) runs:
+
+- `genes`: its genome (`{ key, label, min, max }`); in GLSL each one reads as `G_<KEY>`. A boid's genes sit side by side in one texture, so a longer genome costs no extra texture units.
+- `auxTextures`: 1 or 2 four-float textures of per-boid state that the species' own code reads (`aux`, `aux1`) and writes (`o_aux`, `o_aux1`) each step.
+- `senses`: what it recognises. `flock` is its own kind, through the shared neighbour grid. `items` are fixed things from `gpu/PondGpu.js` (flowers, scum, lily pads), each giving the shader a pull `P_<key>`, a count `N_<key>` and the nearest one, `NEAR_<key>`.
+- `tickParam` and `remember`: its tick rate, the param holding how many steps pass between looks around (the panel's Tick rate slider). Above 1 the boids take turns: each step a share of them senses its flock and items and keeps what it sensed in a small per-boid texture, and the rest recall theirs instead of scanning. `remember` names the flock totals `pre` declares that are kept (`{ n: 'int', sc: 'vec2' }`); the item senses are kept as the species' code uses them. Midges look every 4 steps by default, fish every step.
+- `glsl`: its own code. `pre` sets how far it sees, `visit` runs for each neighbour, and `act` turns the senses into forces and moves it.
+- `forces`: the force vectors to show. The selected boid's arrows and legend come from these.
+- `spawn`, `describe`, `alive`: how a new one starts, how the selected one is described in the panel, and whether it counts as alive.
+- `lays` and `egg` (optional): births. The shader marks a lay in `aux1`, and `engine/Laying.js` reads it back and places an egg (`egg()`, with a mutated copy of the genome) in a free slot. Midges use this.
+
+Range rings, selection, the force overlay, profiles and stats come from the base for free.

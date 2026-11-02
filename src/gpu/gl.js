@@ -122,6 +122,7 @@ export class Readback {
 
   poll() {
     const gl = this.gl
+    const ready = []
     this.pending = this.pending.filter((r) => {
       if (gl.getSyncParameter(r.sync, gl.SYNC_STATUS) !== gl.SIGNALED) return true
       const out = new Float32Array(r.bytes / 4)
@@ -130,9 +131,11 @@ export class Readback {
       gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null)
       gl.deleteSync(r.sync)
       gl.deleteBuffer(r.pbo)
-      r.callback(out)
+      ready.push([r.callback, out])
       return false
     })
+    // After the list is settled: a callback may start another read.
+    for (const [callback, out] of ready) callback(out)
   }
 
   destroy() {

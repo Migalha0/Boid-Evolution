@@ -1,10 +1,11 @@
 import { useState } from 'react'
+import { FADE_TRANSITION, FADED, useIdleFade } from './useIdleFade.js'
 
 /**
  * Every kind of creature's numbers over time on one graph, in a drawer that
  * hides at the bottom of the screen and slides up while its tab is hovered.
- * One shared y axis, log by default since the fish run to thousands and the
- * dragonflies to tens. Colours: the first three categorical slots (dark
+ * One shared y axis, log by default since the counts differ by orders of
+ * magnitude. Colours: the first categorical slots (dark
  * steps), validated all-pairs against the dark surface; each line also ends
  * in its creature's icon, so identity never rests on colour alone.
  */
@@ -12,7 +13,6 @@ import { useState } from 'react'
 const SERIES = [
   { key: 'fish', index: 1, label: 'Fish', colour: '#3987e5', Icon: FishIcon },
   { key: 'midges', index: 2, label: 'Midges', colour: '#199e70', Icon: MidgeIcon },
-  { key: 'dragonflies', index: 3, label: 'Dragonflies', colour: '#d95926', Icon: DragonflyIcon },
 ]
 
 const W = 640
@@ -37,19 +37,6 @@ function MidgeIcon({ colour }) {
     </g>
   )
 }
-function DragonflyIcon({ colour }) {
-  return (
-    <g fill={colour} className="stroke-slate-900" strokeWidth="1.5" paintOrder="stroke">
-      <ellipse cx="-4.4" cy="-1.6" rx="4.2" ry="1.3" opacity="0.75" />
-      <ellipse cx="4.4" cy="-1.6" rx="4.2" ry="1.3" opacity="0.75" />
-      <ellipse cx="-3.8" cy="1.2" rx="3.6" ry="1.1" opacity="0.75" />
-      <ellipse cx="3.8" cy="1.2" rx="3.6" ry="1.1" opacity="0.75" />
-      <rect x="-1" y="-3" width="2" height="11" rx="1" />
-      <circle cx="0" cy="-4" r="1.8" />
-    </g>
-  )
-}
-
 /** An icon as a standalone inline SVG, for the legend and the tab. */
 function Badge({ series, size = 16 }) {
   const { Icon, colour } = series
@@ -66,6 +53,8 @@ const fmtTime = (t) => `${(t / 60).toFixed(t < 600 ? 1 : 0)} min`
 export default function PopulationDrawer({ history = [] }) {
   const [log, setLog] = useState(true)
   const [hover, setHover] = useState(null)
+  // Its tab, left alone for a while, all but disappears (the drawer opens on hover, so that resets it).
+  const [faded, fadeHandlers] = useIdleFade(true)
   const last = history[history.length - 1]
   // Only kinds that have been in the sim at some point in the window.
   const shown = SERIES.filter((s) => history.some((h) => h[s.index] != null && h[s.index] > 0) || (last && last[s.index] > 0))
@@ -74,11 +63,15 @@ export default function PopulationDrawer({ history = [] }) {
     <div className="pointer-events-none absolute inset-x-0 bottom-0 flex justify-center px-4">
       <div
         className="group pointer-events-auto w-full max-w-[680px] translate-y-[calc(100%-2rem)] transition-transform duration-300 ease-out hover:translate-y-0 focus-within:translate-y-0"
-        onPointerLeave={() => setHover(null)}
+        onPointerEnter={fadeHandlers.onPointerEnter}
+        onPointerLeave={(e) => {
+          setHover(null)
+          fadeHandlers.onPointerLeave(e)
+        }}
       >
         <button
           type="button"
-          className="mx-auto flex h-8 items-center gap-3 rounded-t-lg border border-b-0 border-slate-700/60 bg-slate-900/95 px-3 text-[11px] text-slate-300 outline-none focus-visible:ring-2 focus-visible:ring-sky-400"
+          className={`mx-auto flex h-8 items-center gap-3 rounded-t-lg border border-b-0 px-3 text-[11px] text-slate-300 outline-none focus-visible:ring-2 focus-visible:ring-sky-400 ${FADE_TRANSITION} ${faded ? FADED : 'border-slate-700/60 bg-slate-900/95'}`}
           aria-label="Population graph"
         >
           <span className="text-slate-400 transition-transform duration-300 group-hover:rotate-180">▲</span>
@@ -122,7 +115,7 @@ export default function PopulationDrawer({ history = [] }) {
 
 function Chart({ history, shown, log, hover, setHover }) {
   if (history.length < 2) return <p className="py-8 text-center text-[11px] text-slate-500">Collecting samples…</p>
-  if (!shown.length) return <p className="py-8 text-center text-[11px] text-slate-500">Nothing alive yet: spawn fish, midges or dragonflies.</p>
+  if (!shown.length) return <p className="py-8 text-center text-[11px] text-slate-500">Nothing alive yet: spawn fish or midges.</p>
   const t0 = history[0][0]
   const t1 = history[history.length - 1][0]
   let top = 1

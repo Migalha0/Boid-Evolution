@@ -1,8 +1,12 @@
 import { useRef, useState } from 'react'
-import { downloadProfile, loadLibrary, makeProfile, parseProfile, saveLibrary } from '../sim/profiles.js'
+import { FORCES, SEEN_STYLES } from '../render/focus.js'
+import { downloadProfile, loadLibrary, makeIndividualProfile, makeProfile, parseProfile, saveLibrary } from '../sim/profiles.js'
 import { Hint, Section, Toggle } from './controls.jsx'
 
-/** Pieces both evolving species' tabs (midges, dragonflies) are made of. */
+/** Pieces an evolving species' tab (midges) is made of. */
+
+/** A button that removes something (asks first where it is used). */
+export const dangerButton = 'rounded-md px-2 py-1 text-[11px] text-red-300/80 ring-1 ring-red-400/25 hover:bg-red-500/10 hover:text-red-200 disabled:opacity-40 disabled:hover:bg-transparent'
 
 export const button = 'rounded-md bg-slate-800 px-2 py-1 text-[11px] text-slate-200 hover:bg-slate-700 disabled:opacity-40 disabled:hover:bg-slate-800'
 const fmt = (v) => (Math.abs(v) >= 10 ? v.toFixed(0) : v.toFixed(2))
@@ -55,6 +59,30 @@ export function PopulationChart({ history, title = 'Midges alive', stroke = 'str
   )
 }
 
+/**
+ * How a species lives, at a glance: what it eats and what it takes to breed,
+ * each as a short list (`food`, `breeding`: arrays of lines). Gene names in
+ * the lines match the gene tables.
+ */
+export function HowTheyLive({ food, breeding, breedingTitle }) {
+  const list = (title, lines) => (
+    <div>
+      <h4 className="mb-0.5 text-[11px] text-slate-300">{title}</h4>
+      <ul className="list-disc space-y-0.5 pl-4 text-[10px] leading-snug text-slate-400 marker:text-slate-600">
+        {lines.map((l, k) => (
+          <li key={k}>{l}</li>
+        ))}
+      </ul>
+    </div>
+  )
+  return (
+    <Section title="How they live">
+      {list('Food', food)}
+      {list(breedingTitle, breeding)}
+    </Section>
+  )
+}
+
 /** Genes as a compact table; `spread` adds ± columns, `compare` a second genome alongside. */
 export function GeneTable({ genes, spread, compare, compareLabel, list }) {
   return (
@@ -83,14 +111,29 @@ export function GeneTable({ genes, spread, compare, compareLabel, list }) {
   )
 }
 
+/** What a profile holds, as a short tag: a population average or one individual's genes. */
+function SourceTag({ profile: p }) {
+  const one = p.source === 'individual'
+  return (
+    <span
+      className={`shrink-0 rounded px-1 text-[9px] uppercase tracking-wide ${one ? 'bg-amber-400/15 text-amber-300' : 'bg-sky-400/15 text-sky-300'}`}
+      title={one ? `The exact genes of one individual (#${p.individual ?? '?'})` : `The average genes of ${p.population ?? '?'} living at the time`}
+    >
+      {one ? 'one' : 'avg'}
+    </span>
+  )
+}
+
 /**
- * A species' saved profiles: save the population, import / export files
- * (only that species' format is accepted), choose one to give to everyone or
- * start over from, lock to it. `profileKey` / `lockKey`: the params holding
- * the chosen profile and the lock; `actions`: restart(profile?),
- * apply(profile), population(); `stats`: the species' (time, extinctions).
+ * A species' saved profiles: save the population's average or the selected
+ * individual, import / export files (only that species' format is
+ * accepted), choose one to give to everyone or start over from, lock to it.
+ * `profileKey` / `lockKey`: the params holding the chosen profile and the
+ * lock; `actions`: restart(profile?), apply(profile), population(); `stats`:
+ * the species' (time, extinctions, selected); `singular`: one of them
+ * ("midge").
  */
-export function Profiles({ species, title, params, setParam, stats, actions, profileKey, lockKey, plural, restartLabel }) {
+export function Profiles({ species, title, params, setParam, stats, actions, profileKey, lockKey, singular, plural, restartLabel }) {
   const [library, setLibrary] = useState(() => loadLibrary(species))
   const [name, setName] = useState('')
   const [error, setError] = useState(null)
@@ -105,11 +148,18 @@ export function Profiles({ species, title, params, setParam, stats, actions, pro
     update([profile, ...library.filter((p) => p.name !== profile.name)])
     setParam(profileKey, profile)
   }
-  const saveCurrent = () => {
+  const selected = stats?.selected ?? null
+  const saveAverage = () => {
     const pop = actions.population()
     if (!pop) return setError(`No ${plural} alive to save.`)
     setError(null)
-    add(makeProfile(species, name.trim() || `${species} gen ${pop.generation.toFixed(0)} · ${new Date().toLocaleString()}`, pop, params, stats?.time ?? 0, stats?.extinctions ?? 0))
+    add(makeProfile(species, name.trim() || `${plural} avg · gen ${pop.generation.toFixed(0)} · ${new Date().toLocaleString()}`, pop, params, stats?.time ?? 0, stats?.extinctions ?? 0))
+    setName('')
+  }
+  const saveSelected = () => {
+    if (!selected) return setError(`Click a ${singular} on the pond to select it first.`)
+    setError(null)
+    add(makeIndividualProfile(species, name.trim() || `${singular} #${selected.id} · gen ${selected.generation} · ${new Date().toLocaleString()}`, selected, params, stats?.time ?? 0))
     setName('')
   }
   const importFiles = async (files) => {
@@ -128,15 +178,18 @@ export function Profiles({ species, title, params, setParam, stats, actions, pro
   }
   return (
     <Section title={title}>
-      <div className="flex gap-1">
-        <input
-          value={name}
-          onChange={(e) => setName(e.target.value)}
-          placeholder="name (optional)"
-          className="min-w-0 flex-1 rounded-md bg-slate-800 px-2 py-1 text-[11px] text-slate-200 placeholder:text-slate-500"
-        />
-        <button type="button" className={button} onClick={saveCurrent}>
-          Save current
+      <input
+        value={name}
+        onChange={(e) => setName(e.target.value)}
+        placeholder="name for the next save (optional)"
+        className="w-full rounded-md bg-slate-800 px-2 py-1 text-[11px] text-slate-200 placeholder:text-slate-500"
+      />
+      <div className="grid grid-cols-2 gap-1">
+        <button type="button" className={button} onClick={saveAverage} disabled={!stats?.population} title={`The average of every living one of the ${plural}' genes (with how much they vary)`}>
+          Save average
+        </button>
+        <button type="button" className={button} onClick={saveSelected} disabled={!selected} title={selected ? `The exact genes of ${singular} #${selected.id}` : `Click a ${singular} on the pond to select it`}>
+          {selected ? `Save #${selected.id}` : `Save selected`}
         </button>
       </div>
       <div className="flex gap-1">
@@ -156,7 +209,13 @@ export function Profiles({ species, title, params, setParam, stats, actions, pro
               key={p.name}
               className={`flex items-center gap-1 rounded-md px-1.5 py-1 text-[11px] ${chosen?.name === p.name ? 'bg-sky-500/15 text-sky-100' : 'text-slate-300 hover:bg-slate-800'}`}
             >
-              <button type="button" className="min-w-0 flex-1 truncate text-left" title={`generation ${p.generation}, ${p.population} ${plural}, ${Math.round((p.trainedSeconds ?? 0) / 60)} min`} onClick={() => choose(chosen?.name === p.name ? null : p)}>
+              <SourceTag profile={p} />
+              <button
+                type="button"
+                className="min-w-0 flex-1 truncate text-left"
+                title={p.source === 'individual' ? `${singular} #${p.individual ?? '?'}, generation ${p.generation}` : `average of ${p.population} ${plural}, generation ${p.generation}, ${Math.round((p.trainedSeconds ?? 0) / 60)} min`}
+                onClick={() => choose(chosen?.name === p.name ? null : p)}
+              >
                 {p.name}
               </button>
               <button
@@ -188,8 +247,45 @@ export function Profiles({ species, title, params, setParam, stats, actions, pro
         </>
       )}
       <Hint>
-        Save the population&apos;s mean genome as a {species} profile, or import one (from here or <code>npm run train</code>); only {species} profiles are accepted. Choose one to give it to the {plural} or start over from it; locked, every one carries it exactly and nothing mutates.
+        <b className="font-medium text-sky-300">avg</b>: the average genes of all the living {plural} (what <code>npm run train</code> saves too). <b className="font-medium text-amber-300">one</b>: the exact genes of the {singular} you selected (click one on the pond). Only {species} profiles are accepted on import. Choose one to give it to the {plural} or start over from it; locked, every one carries it exactly and nothing mutates.
       </Hint>
     </Section>
+  )
+}
+
+/**
+ * What a selected creature senses and the forces on it, matching the marks
+ * and arrows drawn over it (render/focus.js): `senses` is a species'
+ * focus summary ({ seen: { key: count }, forces: { key: size } }), `list`
+ * the species' senses ({ key, label }) in the order to show them.
+ */
+export function ForceLegend({ senses, list }) {
+  if (!senses) return null
+  const hex = (c) => `rgb(${c.map((v) => Math.round(v * 255)).join(',')})`
+  return (
+    <div className="space-y-0.5 border-t border-amber-400/20 pt-1.5">
+      <div className="text-amber-300/70">
+        sees{' '}
+        {list.map(({ key, label }, k) => {
+          const colour = SEEN_STYLES[key]?.colour
+          return (
+            <span key={key}>
+              {k > 0 && ' · '}
+              {colour && <span className="mr-0.5 inline-block h-2 w-2 rounded-full" style={{ background: hex(colour) }} />}
+              {senses.seen?.[key] ?? 0} {label.toLowerCase()}
+            </span>
+          )
+        })}
+      </div>
+      {FORCES.filter((f) => senses.forces?.[f.key] != null).map((f) => (
+        <div key={f.key} className="flex items-center gap-1.5">
+          <span className="inline-block h-0.5 w-3" style={{ background: f.hex }} />
+          <span className="flex-1">{f.label}</span>
+          <span className="tabular-nums">
+            {senses.forces[f.key].toFixed(0)} {f.unit ?? 'px/s²'}
+          </span>
+        </div>
+      ))}
+    </div>
   )
 }

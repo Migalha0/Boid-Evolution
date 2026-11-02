@@ -1,6 +1,6 @@
-import { LOGS } from '../render/shaders.js'
+import { LOGS, trunkLookFS } from '../render/shaders.js'
 import { LOG_STRIDE, MAX_LOG_SEGMENTS, packLogs } from '../sim/Logs.js'
-import { ELEV_CELL, SDF_CELL } from '../sim/PondMap.js'
+import { ELEV_CELL, SDF_CELL, TINT_CELL } from '../sim/PondMap.js'
 import { createFramebuffer, createProgram, createTexture } from './gl.js'
 import { passVS } from './simShaders.js'
 
@@ -28,7 +28,9 @@ void main() {
  * Also the fallen trunks: as a texture for the renderer (3 texels per
  * segment, one row each) and as a uniform array for the simulation, plus the
  * surface SDF that floating things (scum, pads) keep to, and the baked trunk
- * map (see trunkBakeFS). `version` changes whenever anything here does.
+ * map (see trunkBakeFS) and their colours (trunkLook: render/shaders.js
+ * trunkLookFS), both baked once per trunk layout. `version` changes whenever
+ * anything here does.
  */
 export class MapTextures {
   constructor(gl, map) {
@@ -37,6 +39,7 @@ export class MapTextures {
     this.elevation = linearTexture(gl)
     this.sdf = linearTexture(gl)
     this.surface = linearTexture(gl)
+    this.tint = linearTexture(gl) // plants' colour regions: r brown, g yellow (PondMap.tint)
     this.logs = gl.createTexture()
     gl.bindTexture(gl.TEXTURE_2D, this.logs)
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST)
@@ -45,6 +48,9 @@ export class MapTextures {
     /** Segments as vec4[2 * MAX_LOG_SEGMENTS]: (a, b), (ra, rb, za, zb). */
     this.logUniforms = new Float32Array(MAX_LOG_SEGMENTS * 8)
     this.trunkProg = createProgram(gl, passVS, trunkBakeFS)
+    this.trunkLookProg = createProgram(gl, passVS, trunkLookFS)
+    this.trunkLook = null
+    this.trunkLookFbo = null
     this.trunkMap = null
     this.trunkFbo = null
     this.trunkDims = [0, 0]
@@ -61,6 +67,10 @@ export class MapTextures {
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.R16F, map.cols, map.rows, 0, gl.RED, gl.FLOAT, map.elevation)
       gl.bindTexture(gl.TEXTURE_2D, this.sdf)
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.R16F, map.sdfCols, map.sdfRows, 0, gl.RED, gl.FLOAT, map.sdf)
+      gl.bindTexture(gl.TEXTURE_2D, this.tint)
+      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1)
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RG8, map.tint.cols, map.tint.rows, 0, gl.RG, gl.UNSIGNED_BYTE, map.tint.data)
+      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4)
     }
     gl.bindTexture(gl.TEXTURE_2D, this.surface)
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.R16F, map.sdfCols, map.sdfRows, 0, gl.RED, gl.FLOAT, map.surfaceSdf)
@@ -86,18 +96,23 @@ export class MapTextures {
       gl.deleteFramebuffer(this.trunkFbo)
       this.trunkMap = createTexture(gl, gl.RG16F, w, h)
       this.trunkFbo = createFramebuffer(gl, [this.trunkMap])
+      gl.deleteTexture(this.trunkLook)
+      gl.deleteFramebuffer(this.trunkLookFbo)
+      this.trunkLook = createTexture(gl, gl.RGBA8, w, h)
+      this.trunkLookFbo = createFramebuffer(gl, [this.trunkLook])
       this.trunkDims = [w, h]
     }
-    const { program, u } = this.trunkProg
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this.trunkFbo)
     gl.viewport(0, 0, w, h)
     gl.disable(gl.BLEND)
-    gl.useProgram(program)
-    gl.bindTexture(gl.TEXTURE_2D, this.logs)
-    gl.uniform1i(u.u_logs, 0)
-    gl.uniform1i(u.u_logCount, this.logCount)
     gl.bindVertexArray(null)
-    gl.drawArrays(gl.TRIANGLES, 0, 3)
+    for (const [prog, fbo] of [[this.trunkProg, this.trunkFbo], [this.trunkLookProg, this.trunkLookFbo]]) {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, fbo)
+      gl.useProgram(prog.program)
+      gl.bindTexture(gl.TEXTURE_2D, this.logs)
+      gl.uniform1i(prog.u.u_logs, 0)
+      gl.uniform1i(prog.u.u_logCount, this.logCount)
+      gl.drawArrays(gl.TRIANGLES, 0, 3)
+    }
     gl.bindFramebuffer(gl.FRAMEBUFFER, null)
     gl.enable(gl.BLEND)
   }
@@ -113,6 +128,13 @@ export class MapTextures {
   get sdfExtent() {
     return [this.map.sdfCols * SDF_CELL, this.map.sdfRows * SDF_CELL]
   }
+  /** Tint samples sit at i * cell, like the elevation. */
+  get tintCell() {
+    return TINT_CELL
+  }
+  get tintDims() {
+    return [this.map.tint.cols, this.map.tint.rows]
+  }
   get sdfCell() {
     return SDF_CELL
   }
@@ -125,10 +147,14 @@ export class MapTextures {
     this.gl.deleteTexture(this.elevation)
     this.gl.deleteTexture(this.sdf)
     this.gl.deleteTexture(this.surface)
+    this.gl.deleteTexture(this.tint)
     this.gl.deleteTexture(this.logs)
     this.gl.deleteTexture(this.trunkMap)
     this.gl.deleteFramebuffer(this.trunkFbo)
     this.gl.deleteProgram(this.trunkProg.program)
+    this.gl.deleteTexture(this.trunkLook)
+    this.gl.deleteFramebuffer(this.trunkLookFbo)
+    this.gl.deleteProgram(this.trunkLookProg.program)
   }
 }
 

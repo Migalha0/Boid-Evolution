@@ -1,9 +1,8 @@
 import { createFramebuffer, createProgram, createTexture } from '../gpu/gl.js'
 import { SCUM_CELL } from '../gpu/ScumField.js'
-import { INSECT_STRIDE } from '../sim/Insects.js'
 import { PAD_STRIDE } from '../sim/LilyPads.js'
 import { LAND_LEVEL } from '../sim/PondMap.js'
-import { MAX_KINDS, PLANT_KINDS, PLANT_STRIDE } from '../sim/Vegetation.js'
+import { MAX_KINDS, PLANT_KINDS, PLANT_STRIDE, plantSlots } from '../sim/Vegetation.js'
 import { createCloudTexture } from './clouds.js'
 import * as S from './shaders.js'
 
@@ -13,11 +12,16 @@ const ACC_LOW = [0.6, 0.4, 0.75]
 const ACC_HIGH = [0.9, 0.4, 0.55]
 const VISION = [0.75, 0.85, 0.85]
 const VISION_SELECTED = [0.95, 0.8, 0.45]
+/** Range ring opacity for every one / the selected one (fish and midges alike). */
+const RANGE_ALPHA = 0.18
+const RANGE_SELECTED_ALPHA = 0.8
+/** With 'all', rings fade as they get many, so thousands don't wash the pond out. */
+const rangeAlpha = (n) => RANGE_ALPHA * Math.min(1, Math.max(0.02, 400 / Math.max(n, 1)))
 /** Lily pads float lower than the scum mats: their shadow offset, relative to the scum's. */
 const PAD_HEIGHT = 0.275
 
 /**
- * Params -> the shaders' `Tunables` uniform block (TUNE in shaders.js): seven
+ * Params -> the shaders' `Tunables` uniform block (TUNE in shaders.js): eight
  * vec4s, in slot order (the last one padded). Each entry turns panel units into the shader's.
  */
 const TUNABLES = [
@@ -49,13 +53,13 @@ const TUNABLES = [
   (p) => p.deepFade,
   (p) => p.siltOpacity,
   (p) => (p.showPlants ? p.sludgeAmount : 0), // SLUDGE
+  (p) => p.depthEffect, // DEPTH_EFFECT
 ]
 const TUNE_BINDING = 0
 
 // Texture units: sim state/aux are bound once per frame and shared by all programs.
 const UNIT_STATE = 0
 const UNIT_AUX = 1
-const UNIT_FIELD = 2
 const UNIT_TRAITS = 3
 const UNIT_ELEV = 4
 const UNIT_SCENE = 5
@@ -75,11 +79,37 @@ const UNIT_TRUNKS = 16 // baked trunk map (MapTextures.trunkMap)
 const UNIT_BLOOM = 17 // flower nectar, one texel per plant (sorted like the plants)
 const UNIT_SCUM_LAYER = 18 // this frame's scum, unshaded (see drawScum)
 const UNIT_SILT = 19
+/** A GPU species' textures for the midge programs: state, aux, traits, state at the frame's start, range gene, items, nectar. */
+const UNIT_M_STATE = 20
+const UNIT_M_AUX = 21
+const UNIT_M_TRAITS = 22
+const UNIT_M_PREV = 23
+const UNIT_M_RANGE = 24
+const UNIT_M_ITEMS = 25
+const UNIT_M_NECTAR = 26
+const UNIT_PLANT_DENSITY = 27 // how crowded with plants, for the scum bake
+const UNIT_TRUNK_LOOK = 28 // baked trunk colours (MapTextures.trunkLook)
+const UNIT_TINT = 29 // the plants' colour regions (MapTextures.tint), for the soil
+const UNIT_FLOWER_LOOK = 30 // each plant's head colours, fresh and withered (gpu/PondGpu.js flowerLook)
+const UNIT_M_AUX1 = 31 // a GPU species' aux1 (midges: when and where it last laid), for the ripples
+/** Midge trails: colour (a pale brown, so it reads over dark water), head opacity, and the fastest a midge flies (px/s). */
+const MIDGE_TRAIL = [0.36, 0.3, 0.22]
+const TRAIL_ALPHA = 0.55
+const TRAIL_MAX_SPEED = 200
+/** The selected midge's view: lines to the midges it sees; rings round items, per source (gpu/PondGpu.js SOURCE order). */
+const SEEN_MIDGES = [0.85, 0.9, 0.9, 0.3]
+/** Plant density for the scum bake: cell size (px), and plants per (blurred) cell that count as fully crowded. */
+const PLANT_DENSITY_CELL = 12
+const PLANT_DENSITY_FULL = 1.5
+
 /** Frond cells drawn beyond each side of the view: fronds drift up to 30 px (ScumField). */
 const SCUM_MARGIN_CELLS = 12
 
+/** Wind-shaped patterns (cloud wisps, ripples) use fixed directions this far apart (degrees), blending between two. */
+const PATTERN_WIND_STEP = 30
+
 /** Unit vector the wind blows towards; direction in degrees clockwise from north (screen up). */
-export function windVector(direction) {
+function windVector(direction) {
   const a = (direction * Math.PI) / 180
   return [Math.sin(a), -Math.cos(a)]
 }
@@ -89,7 +119,19 @@ export function windVector(direction) {
  * @param azimuth sun direction in degrees, clockwise from north (screen up)
  * @param elevation sun height above the horizon in degrees
  */
-export function lightVector(azimuth, elevation) {
+/**
+ * The light on the scene from the sun's height (degrees) and the overall
+ * brightness: stronger the higher it stands (from 0.7x near the horizon to
+ * 1.2x overhead), and warmer when it is low.
+ */
+function sunlight(elevation, brightness) {
+  const h = Math.sin((elevation * Math.PI) / 180)
+  const level = brightness * (0.7 + 0.5 * h)
+  const warm = 1 - Math.min(1, Math.max(0, (elevation - 12) / 33)) // 1 near the horizon, 0 from 45°
+  return [level, level * (1 - 0.1 * warm), level * (1 - 0.25 * warm)]
+}
+
+function lightVector(azimuth, elevation) {
   const a = (azimuth * Math.PI) / 180
   const len = 1 / Math.tan((Math.max(1, Math.min(89, elevation)) * Math.PI) / 180)
   return [-Math.sin(a) * len, Math.cos(a) * len]
@@ -109,7 +151,6 @@ export class BoidRenderer {
     this.boidProg = createProgram(gl, S.boidVS, S.boidFS)
     this.vectorProg = createProgram(gl, S.vectorVS, S.vectorFS)
     this.visionProg = createProgram(gl, S.visionVS, S.visionFS)
-    this.fieldProg = createProgram(gl, S.fieldVS, S.fieldFS)
     this.waterProg = createProgram(gl, S.fieldVS, S.waterFS)
     this.plantProg = createProgram(gl, S.plantVS, S.plantFS)
     this.scumProg = createProgram(gl, S.scumVS, S.scumFS)
@@ -120,9 +161,11 @@ export class BoidRenderer {
     this.waterFloorProg = createProgram(gl, S.fieldVS, S.waterFloorFS)
     this.waterSurfaceProg = createProgram(gl, S.fieldVS, S.waterSurfaceFS)
     this.padProg = createProgram(gl, S.padVS, S.padFS)
-    this.insectProg = createProgram(gl, S.insectVS, S.insectFS)
+    this.midgeProg = createProgram(gl, S.midgeVS, S.insectFS)
     this.trailProg = createProgram(gl, S.trailVS, S.trailFS)
-    this.shadeProg = createProgram(gl, S.fieldVS, S.shadeFS)
+    this.midgeTrailProg = createProgram(gl, S.midgeTrailVS, S.trailFS)
+    this.seenBoidsProg = createProgram(gl, S.seenBoidsVS, S.trailFS)
+    this.seenItemsProg = createProgram(gl, S.seenItemsVS, S.trailFS)
     this.logProg = createProgram(gl, S.logVS, S.logFS)
     this.siltProg = createProgram(gl, S.fieldVS, S.siltFS)
     this.postProg = createProgram(gl, S.fieldVS, S.postFS)
@@ -130,7 +173,6 @@ export class BoidRenderer {
       this.boidProg,
       this.vectorProg,
       this.visionProg,
-      this.fieldProg,
       this.waterProg,
       this.plantProg,
       this.scumProg,
@@ -141,8 +183,11 @@ export class BoidRenderer {
       this.waterFloorProg,
       this.waterSurfaceProg,
       this.padProg,
-      this.insectProg,
-      this.shadeProg,
+      this.midgeProg,
+      this.trailProg,
+      this.midgeTrailProg,
+      this.seenBoidsProg,
+      this.seenItemsProg,
       this.logProg,
       this.siltProg,
       this.postProg,
@@ -156,7 +201,7 @@ export class BoidRenderer {
       const block = gl.getUniformBlockIndex(program, 'Tunables')
       if (block !== gl.INVALID_INDEX) gl.uniformBlockBinding(program, block, TUNE_BINDING)
     }
-    for (const p of [this.boidProg, this.scumCompositeProg, this.plantProg, this.padProg, this.logProg, this.shadowProg, this.waterFloorProg, this.shadeProg]) {
+    for (const p of [this.boidProg, this.scumCompositeProg, this.plantProg, this.padProg, this.logProg, this.shadowProg, this.waterFloorProg]) {
       gl.useProgram(p.program)
       gl.uniform1i(p.u.u_shadowMask, UNIT_SHADOW)
     }
@@ -172,15 +217,19 @@ export class BoidRenderer {
     gl.useProgram(this.waterProg.program)
     gl.uniform1i(this.waterProg.u.u_elev, UNIT_ELEV)
     gl.uniform1i(this.waterProg.u.u_sdf, UNIT_SDF)
+    gl.uniform1i(this.waterProg.u.u_tint, UNIT_TINT)
+    gl.uniform1i(this.waterProg.u.u_trunks, UNIT_TRUNKS)
     gl.useProgram(this.boidProg.program)
     gl.uniform1i(this.boidProg.u.u_trunks, UNIT_TRUNKS)
     gl.uniform1i(this.boidProg.u.u_elev, UNIT_ELEV)
+    gl.uniform1i(this.boidProg.u.u_silt, UNIT_SILT)
     gl.useProgram(this.siltProg.program)
     gl.uniform1i(this.siltProg.u.u_silt, UNIT_SILT)
     gl.uniform1i(this.siltProg.u.u_background, UNIT_BG)
     gl.useProgram(this.logProg.program)
     gl.uniform1i(this.logProg.u.u_logs, UNIT_LOGS)
     gl.uniform1i(this.logProg.u.u_background, UNIT_BG)
+    gl.uniform1i(this.logProg.u.u_trunkLook, UNIT_TRUNK_LOOK)
     gl.uniform1i(this.logProg.u.u_elev, UNIT_ELEV)
     // Scum floats: it keeps to the surface SDF, so it never lies on a trunk.
     gl.useProgram(this.scumProg.program)
@@ -199,8 +248,6 @@ export class BoidRenderer {
     gl.uniform1i(this.scumBakeProg.u.u_elev, UNIT_ELEV)
     gl.uniform1i(this.scumBakeProg.u.u_sdf, UNIT_SURFACE)
     this.setupPlantKinds()
-    gl.useProgram(this.fieldProg.program)
-    gl.uniform1i(this.fieldProg.u.u_field, UNIT_FIELD)
     for (const p of [this.waterFloorProg, this.waterSurfaceProg]) {
       gl.useProgram(p.program)
       gl.uniform1i(p.u.u_background, UNIT_BG)
@@ -210,14 +257,14 @@ export class BoidRenderer {
     gl.uniform1i(this.waterSurfaceProg.u.u_sway, UNIT_SWAY)
     // Ripples keep off trunks breaking the surface.
     gl.uniform1i(this.waterSurfaceProg.u.u_sdf, UNIT_SURFACE)
-    gl.useProgram(this.shadeProg.program)
-    gl.uniform1i(this.shadeProg.u.u_clouds, UNIT_CLOUDS)
     gl.useProgram(this.postProg.program)
     gl.uniform1i(this.postProg.u.u_scene, UNIT_SCENE)
     gl.uniform1i(this.postProg.u.u_clouds, UNIT_CLOUDS)
     gl.activeTexture(gl.TEXTURE0 + UNIT_CLOUDS)
     this.cloudTex = createCloudTexture(gl)
     this.cloudShift = [0, 0]
+    this.windTravel = [0, 0] // how far the wind has blown (unit vector x s), for patterns drifting with it
+    this.causticShift = [0, 0] // how far the caustics have drifted downwind (noise tiles)
     this.cloudTime = null
 
     this.vao = gl.createVertexArray()
@@ -231,19 +278,8 @@ export class BoidRenderer {
       gl.vertexAttribPointer(loc, 4, gl.FLOAT, false, PAD_STRIDE * 4, loc * 16)
       gl.vertexAttribDivisor(loc, 1)
     }
-    // Point buffers drawn by the insect program, one per source (midges,
-    // dragonflies), made on first use.
-    this.pointSets = new Map()
-    // Insect motion trails: lines of x, y, premultiplied r, g, b, a per vertex.
-    this.trailBuf = gl.createBuffer()
-    this.trailVao = gl.createVertexArray()
-    gl.bindVertexArray(this.trailVao)
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.trailBuf)
-    gl.enableVertexAttribArray(0)
-    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 24, 0)
-    gl.enableVertexAttribArray(1)
-    gl.vertexAttribPointer(1, 4, gl.FLOAT, false, 24, 8)
-    this.trailVersion = -1
+    // Lines (the focus overlays), one buffer per source, made on first use.
+    this.lineSets = new Map()
     this.plantTex = null
     gl.bindVertexArray(null)
     this.plantVersion = -1
@@ -264,15 +300,6 @@ export class BoidRenderer {
     this.low = [0, 0]
     this.sceneTex = null
     this.sceneFbo = null
-
-    this.fieldTex = gl.createTexture()
-    gl.bindTexture(gl.TEXTURE_2D, this.fieldTex)
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
-    this.fieldVersion = -1
-    this.fieldPixels = new Uint8Array(0)
   }
 
   /** Plant kinds are static: upload their parameters once as uniform arrays. */
@@ -282,7 +309,6 @@ export class BoidRenderer {
     const base = new Float32Array(MAX_KINDS * 3)
     const tip = new Float32Array(MAX_KINDS * 3)
     const head = new Float32Array(MAX_KINDS * 4)
-    const headColor = new Float32Array(MAX_KINDS * 3)
     const spread = new Float32Array(MAX_KINDS)
     const regional = new Float32Array(MAX_KINDS)
     PLANT_KINDS.forEach((k, i) => {
@@ -291,10 +317,7 @@ export class BoidRenderer {
       tip.set(k.tip, i * 3)
       spread[i] = k.spread
       regional[i] = k.regional ?? 0
-      if (k.head) {
-        head.set([1, k.head.length, k.head.width, 0], i * 4)
-        headColor.set(k.head.color, i * 3)
-      }
+      if (k.head) head.set([1, k.head.length, k.head.width, 0], i * 4)
     })
     const { program, u } = this.plantProg
     gl.useProgram(program)
@@ -302,17 +325,32 @@ export class BoidRenderer {
     gl.uniform3fv(u['u_kindBase[0]'], base)
     gl.uniform3fv(u['u_kindTip[0]'], tip)
     gl.uniform4fv(u['u_kindHead[0]'], head)
-    gl.uniform3fv(u['u_kindHeadColor[0]'], headColor)
     gl.uniform1fv(u['u_kindSpread[0]'], spread)
     gl.uniform1fv(u['u_kindRegional[0]'], regional)
     gl.uniform1i(u.u_sway, UNIT_SWAY)
     gl.uniform1i(u.u_plants, UNIT_PLANTS)
     gl.uniform1i(u.u_bloom, UNIT_BLOOM)
+    gl.uniform1i(u.u_flowerLook, UNIT_FLOWER_LOOK)
     gl.useProgram(this.padProg.program)
     gl.uniform1i(this.padProg.u.u_sway, UNIT_SWAY)
     gl.uniform1i(this.padProg.u.u_elev, UNIT_ELEV)
-    gl.useProgram(this.insectProg.program)
-    gl.uniform1i(this.insectProg.u.u_elev, UNIT_ELEV)
+    gl.useProgram(this.midgeProg.program)
+    gl.uniform1i(this.midgeProg.u.u_elev, UNIT_ELEV)
+    // Midge textures (a GPU species, gpu/boids/BoidKernel.js) for every program that reads them.
+    for (const prog of [this.midgeProg, this.midgeTrailProg, this.seenBoidsProg, this.seenItemsProg]) {
+      gl.useProgram(prog.program)
+      gl.uniform1i(prog.u.u_mState, UNIT_M_STATE)
+      gl.uniform1i(prog.u.u_mAux, UNIT_M_AUX)
+      gl.uniform1i(prog.u.u_mTraits, UNIT_M_TRAITS)
+      gl.uniform1i(prog.u.u_mPrev, UNIT_M_PREV)
+      gl.uniform1i(prog.u.u_rangeTex, UNIT_M_RANGE)
+      gl.uniform1i(prog.u.u_items, UNIT_M_ITEMS)
+      gl.uniform1i(prog.u.u_nectar, UNIT_M_NECTAR)
+      gl.uniform1i(prog.u.u_flowerLook, UNIT_FLOWER_LOOK)
+      gl.uniform1i(prog.u.u_mAux1, UNIT_M_AUX1)
+    }
+    gl.useProgram(this.visionProg.program)
+    gl.uniform1i(this.visionProg.u.u_rangeTex, UNIT_M_RANGE)
   }
 
   /** @param viewOffset world position of the screen's top-left corner */
@@ -356,12 +394,6 @@ export class BoidRenderer {
     gl.deleteFramebuffer(this.scumLayerFbo)
     this.scumLayerTex = createTexture(gl, gl.RGBA8, w, h)
     this.scumLayerFbo = createFramebuffer(gl, [this.scumLayerTex])
-    // Coarse light map for the midges (see drawShade).
-    gl.deleteTexture(this.shadeTex)
-    gl.deleteFramebuffer(this.shadeFbo)
-    this.shadeDims = [Math.ceil(w / S.SHADE_CELL), Math.ceil(h / S.SHADE_CELL)]
-    this.shadeTex = createTexture(gl, gl.RGBA32F, ...this.shadeDims)
-    this.shadeFbo = createFramebuffer(gl, [this.shadeTex])
     this.pixelSize = pixelSize
     this.low = [w, h]
     // The scene shows exactly the canvas' world extent; a scene pixel is
@@ -388,24 +420,37 @@ export class BoidRenderer {
    * @param {import('../gpu/SwayField.js').SwayField} sway
    * @param {import('../sim/Vegetation.js').Vegetation} vegetation
    */
-  render(sim, field, mapTex, vegetation, sway, scum, silt, pads, insects, dragonflies, params, selected, time) {
+  /**
+   * @param midges the midges to draw ({ kernel, prev, selected, pond }: a GPU
+   *   species, its state at the frame's start, the selected one, the pond's
+   *   items and nectar), or null
+   */
+  render(sim, mapTex, vegetation, sway, scum, silt, pads, midges, params, selected, time, overlays = []) {
     const gl = this.gl
     const n = sim.count
     const px = params.pixelSize
     this.ensureScene(px)
     this.light = lightVector(params.sunAzimuth, params.sunElevation)
-    this.wind = windVector(params.windDirection)
+    // The wind as it blows now (sim/Wind.js), else as set.
+    const wind = this.liveWind?.direction != null ? this.liveWind : { direction: params.windDirection, speed: params.cloudSpeed }
+    this.wind = windVector(wind.direction)
+    this.windSpeed = wind.speed
+    const step = wind.direction / PATTERN_WIND_STEP
+    const k = Math.floor(step)
+    this.windPair = [...windVector(k * PATTERN_WIND_STEP), ...windVector((k + 1) * PATTERN_WIND_STEP)]
+    this.windMix = step - k
     this.floatHeight = params.floatHeight
     this.elevCell = mapTex.elevCell
     this.elevDims = mapTex.elevDims
     // The floor's sludge is sized and murked by the panel: re-render the cached background when those change.
-    this.floorKey = `${params.murkSurface}|${params.murkDeep}|${params.showPlants ? params.sludgeAmount : 0}|${params.floorLitter}|${params.floorStones}|${params.floorTwigs}`
+    this.floorKey = `${params.murkSurface}|${params.murkDeep}|${params.showPlants ? params.sludgeAmount : 0}|${params.floorLitter}|${params.floorStones}|${params.floorTwigs}|${params.sunAzimuth}|${params.sunElevation}|${params.waterTint}|${params.depthEffect}`
     this.floorDetails = [params.floorLitter, params.floorStones, params.floorTwigs]
+    this.waterTint = params.waterTint
     TUNABLES.forEach((f, i) => (this.tuneData[i] = f(params)))
     gl.bindBuffer(gl.UNIFORM_BUFFER, this.tuneBuf)
     gl.bufferSubData(gl.UNIFORM_BUFFER, 0, this.tuneData)
     gl.bindBufferBase(gl.UNIFORM_BUFFER, TUNE_BINDING, this.tuneBuf)
-    this.advanceClouds(params.cloudSpeed, time)
+    this.advanceClouds(this.windSpeed, params.causticSpeed, time)
     gl.activeTexture(gl.TEXTURE0 + UNIT_CLOUDS)
     gl.bindTexture(gl.TEXTURE_2D, this.cloudTex)
 
@@ -429,8 +474,10 @@ export class BoidRenderer {
     gl.bindTexture(gl.TEXTURE_2D, mapTex.logs)
     gl.activeTexture(gl.TEXTURE0 + UNIT_TRUNKS)
     gl.bindTexture(gl.TEXTURE_2D, mapTex.trunkMap)
+    gl.activeTexture(gl.TEXTURE0 + UNIT_TRUNK_LOOK)
+    gl.bindTexture(gl.TEXTURE_2D, mapTex.trunkLook)
     if (params.showPlants) {
-      this.bakeScum(mapTex)
+      this.bakeScum(mapTex, params.scumAmount, vegetation, params.scumAmongPlants)
       this.drawScum(mapTex, scum, time)
     }
     this.drawShadowMask(vegetation, mapTex, sway, scum, pads, time, params.showPlants)
@@ -442,7 +489,6 @@ export class BoidRenderer {
     gl.bindTexture(gl.TEXTURE_2D, this.bgTex) // water colour + depth: animated floor, murk on the fish
     if (waterMotion) this.drawWater(this.waterFloorProg, params, sway, mapTex, time, false)
     else if (params.showPlants) this.darkenShadows()
-    if (field.visible) this.drawField(field)
     this.drawLogs(mapTex, 0) // under water: below the fish swimming over them
 
     gl.activeTexture(gl.TEXTURE0 + UNIT_STATE)
@@ -456,33 +502,34 @@ export class BoidRenderer {
     const sepRatio = Math.min(1, params.separation / params.perception)
     const hasSel = selected >= 0 && selected < n
 
-    if (params.visionMode !== 'off') {
-      const drawVision = (offset, count, color, fill, rim, rings) => {
+    // Range rings, drawn with the midges' (drawMidgeRanges) and in
+    // their style: a thin ring at the vision range, over its field of view;
+    // faint for every fish ('all'), bright for the selected one. Only the
+    // outer ring of the shader's two (no fill, no separation ring).
+    const drawRanges = () => {
+      if (params.fishVisionMode === 'off' || !n) return
+      const ring = (offset, count, color, alpha) => {
         const u = this.use(this.visionProg, sim, offset)
         gl.uniform1f(u.u_radius, params.perception)
         gl.uniform1f(u.u_cosHalfFov, cosHalfFov)
         gl.uniform1f(u.u_sepRatio, sepRatio)
         gl.uniform3fv(u.u_color, color)
-        gl.uniform1f(u.u_fill, fill)
-        gl.uniform1f(u.u_rim, rim)
-        gl.uniform1i(u.u_rings, rings ? 1 : 0)
-        gl.uniform1f(u.u_band, 2 * Math.max(this.cell[0], this.cell[1]))
+        gl.uniform1f(u.u_fill, 0)
+        gl.uniform1f(u.u_rim, alpha)
+        gl.uniform1i(u.u_rings, 1)
+        gl.uniform1f(u.u_band, Math.max(this.cell[0], this.cell[1]))
         gl.uniform1f(u.u_halfSpan, Math.min(Math.PI, ((params.fov * Math.PI) / 180) / 2 + 0.05))
-        gl.drawArraysInstanced(gl.TRIANGLES, 0, rings ? 12 * S.RING_SEGMENTS : 6, count)
+        gl.drawArraysInstanced(gl.TRIANGLES, 0, 6 * S.RING_SEGMENTS, count)
       }
-      if (params.visionMode === 'all') {
-        // Fade with density so thousands of overlapping discs don't saturate.
-        // Rims only: a faint fill over thousands of discs costs more than it shows.
-        const k = Math.min(1, Math.max(0.12, 1200 / n))
-        drawVision(0, n, VISION, 0, 0.07 * k, true)
-      }
-      if (hasSel) drawVision(selected, 1, VISION_SELECTED, 0.1, 0.8, false)
+      if (params.fishVisionMode === 'all') ring(0, n, VISION, rangeAlpha(n))
+      if (hasSel) ring(selected, 1, VISION_SELECTED, RANGE_SELECTED_ALPHA)
     }
 
     const drawBoids = (offset, count, mode, size, shift = [0, 0], tint = [1, 1, 1]) => {
       const u = this.use(this.boidProg, sim, offset)
       gl.uniform1f(u.u_size, size)
       gl.uniform2fv(u.u_shift, shift)
+      gl.uniform2fv(u.u_siltExtent, silt.extent)
       gl.uniform1i(u.u_mode, mode)
       gl.uniform3fv(u.u_tint, tint)
       gl.uniform1f(u.u_maxForce, params.maxForce)
@@ -490,6 +537,10 @@ export class BoidRenderer {
       gl.uniform2fv(u.u_light, this.light)
       gl.uniform1f(u.u_elevCell, mapTex.elevCell)
       gl.uniform2fv(u.u_elevDims, mapTex.elevDims)
+      // Light up the fish the selected one sees (the focus overlay draws its forces).
+      gl.uniform1i(u.u_focusId, hasSel && mode === 0 && offset === 0 ? selected : -1)
+      gl.uniform1f(u.u_focusRange, params.perception)
+      gl.uniform1f(u.u_focusCosFov, params.fov >= 359.9 ? -2 : cosHalfFov)
       gl.drawArraysInstanced(gl.TRIANGLES, 0, S.FISH_VERTS, count)
     }
 
@@ -503,11 +554,11 @@ export class BoidRenderer {
     }
 
     if (params.shadowDarkness > 0) drawBoids(0, n, 1, params.boidSize) // shadows on the floor
-    const midges = params.showInsects && insects.points > 0
-    const hunters = params.showInsects && params.showDragonflies
-    if (midges && params.shadowDarkness > 0) this.drawInsects(insects, 2, time)
-    if (hunters && params.shadowDarkness > 0) this.drawInsects(dragonflies, 2, time)
+    const m = params.showInsects && midges?.kernel.count ? midges : null
+    if (m && params.shadowDarkness > 0) this.drawMidges(m, 2, time)
     if (params.siltOpacity > 0) this.drawSilt(silt)
+    gl.activeTexture(gl.TEXTURE0 + UNIT_SILT)
+    gl.bindTexture(gl.TEXTURE_2D, silt.texture) // the fish read it too (veiled inside a cloud)
     drawBoids(0, n, 0, params.boidSize)
     gl.activeTexture(gl.TEXTURE0 + UNIT_SWAY)
     gl.bindTexture(gl.TEXTURE_2D, sway.texture)
@@ -516,65 +567,48 @@ export class BoidRenderer {
       // Surface layers, over the fish: scum, then lily pads, then emergent plants.
       this.compositeScum()
       this.drawPads(pads, sway, time)
-      if (midges) this.drawInsects(insects, 0, time) // on the water, under overhanging plants
-      if (hunters) this.drawInsects(dragonflies, 0, time) // their clutches
+      if (m) {
+        this.drawMidges(m, 3, time, params) // ripples where they laid or fell
+        this.drawMidges(m, 0, time) // on the water, under overhanging plants
+      }
       this.drawPlants(vegetation, sway, time)
-    } else {
-      if (midges) this.drawInsects(insects, 0, time)
-      if (hunters) this.drawInsects(dragonflies, 0, time)
+    } else if (m) {
+      this.drawMidges(m, 3, time, params)
+      this.drawMidges(m, 0, time)
     }
     this.drawLogs(mapTex, 1) // above water: over everything rooted below
-    if (params.showInsects && params.insectTrails && insects.trails?.count) this.drawTrails(insects.trails) // under the bodies
-    if (midges) this.drawInsects(insects, 1, time) // in the air and on the flowers
-    if (hunters) this.drawInsects(dragonflies, 1, time)
+    if (m && params.insectTrails) this.drawMidgeTrails(m, params) // under the bodies
+    drawRanges()
+    if (m && params.midgeVisionMode !== 'off') this.drawMidgeRanges(m, params, sim)
+    if (m && m.selected >= 0) this.drawMidgeSeen(m)
+    if (m) this.drawMidges(m, 1, time) // in the air and on the flowers
+    // What the selected creature senses and the forces on it (render/focus.js), on top.
+    for (const lines of overlays) if (lines.count) this.drawLines(lines)
     if (hasSel) {
       // Outlined and enlarged so it stands out while keeping its own colour.
       drawBoids(selected, 1, 2, params.boidSize * 2.1, [0, 0], VISION_SELECTED)
       drawBoids(selected, 1, 0, params.boidSize * 1.5)
     }
 
-    if (this.shadeWanted) this.drawShade(params)
     this.present(params)
     gl.bindVertexArray(null)
   }
 
   /**
-   * The coarse light map (shadeFS) into shadeFbo, for the engine to read back.
-   * Its texels cover `shadeCell` world px each, from the view's top-left.
-   */
-  drawShade(params) {
-    const gl = this.gl
-    const { program, u } = this.shadeProg
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this.shadeFbo)
-    gl.viewport(0, 0, ...this.shadeDims)
-    gl.disable(gl.BLEND)
-    gl.useProgram(program)
-    gl.uniform2f(u.u_uvScale, 1, 1)
-    gl.uniform2f(u.u_uvOffset, 0, 0)
-    gl.uniform2f(u.u_view, this.width, this.height)
-    gl.uniform2fv(u.u_viewOffset, this.viewOffset)
-    gl.uniform1i(u.u_cloudsOn, params.showClouds ? 1 : 0)
-    gl.uniform2fv(u.u_cloudShift, this.cloudShift)
-    gl.uniform2fv(u.u_wind, this.wind)
-    gl.drawArrays(gl.TRIANGLES, 0, 3)
-    gl.enable(gl.BLEND)
-    this.shadeWanted = false
-    this.shadeReady = true
-  }
-
-  get shadeCell() {
-    return [this.width / this.shadeDims[0], this.height / this.shadeDims[1]]
-  }
-
-  /**
-   * Carry the clouds downwind. Integrated per frame (not speed * time) so
+   * Carry the clouds (and the caustics, and patterns drifting with the wind)
+   * downwind. Integrated per frame (not speed * time) so
    * changing the speed or direction never makes them jump.
    */
-  advanceClouds(speed, time) {
+  advanceClouds(speed, causticSpeed, time) {
     const dt = Math.max(0, time - (this.cloudTime ?? time))
     this.cloudTime = time
     this.cloudShift[0] += this.wind[0] * speed * dt
     this.cloudShift[1] += this.wind[1] * speed * dt
+    this.windTravel[0] += this.wind[0] * dt
+    this.windTravel[1] += this.wind[1] * dt
+    // Caustics drift downwind as fast as they used to slide (about causticSpeed tiles per s).
+    this.causticShift[0] += this.wind[0] * causticSpeed * dt
+    this.causticShift[1] += this.wind[1] * causticSpeed * dt
   }
 
   /** Cloud-shade, dither and vignette the scene into the (scene-sized) canvas. */
@@ -593,8 +627,13 @@ export class BoidRenderer {
     gl.uniform1i(u.u_cloudsOn, params.showClouds ? 1 : 0)
     gl.uniform2fv(u.u_viewOffset, this.viewOffset)
     gl.uniform2fv(u.u_cell, this.cell)
+    gl.uniform3fv(u.u_sunlight, sunlight(params.sunElevation, params.sunBrightness))
     gl.uniform2fv(u.u_cloudShift, this.cloudShift)
     gl.uniform2fv(u.u_wind, this.wind)
+    gl.uniform4fv(u.u_windPair, this.windPair)
+    gl.uniform1f(u.u_windMix, this.windMix)
+    gl.uniform2fv(u.u_windTravel, this.windTravel)
+    gl.uniform2fv(u.u_causticShift, this.causticShift)
     gl.activeTexture(gl.TEXTURE0 + UNIT_CLOUDS)
     gl.bindTexture(gl.TEXTURE_2D, this.cloudTex)
     gl.bindVertexArray(this.vao)
@@ -644,66 +683,161 @@ export class BoidRenderer {
     gl.bindVertexArray(this.vao)
   }
 
-  /** The GPU buffer and vertex array for a point source ({ data, points, version }), made on first use. */
-  pointSet(source) {
-    let set = this.pointSets.get(source)
-    if (set) return set
+  /** Bind a GPU species' textures for the midge programs (and the range gene, items, nectar). */
+  bindMidges(m) {
     const gl = this.gl
-    set = { buf: gl.createBuffer(), vao: gl.createVertexArray(), version: -1 }
-    gl.bindVertexArray(set.vao)
-    gl.bindBuffer(gl.ARRAY_BUFFER, set.buf)
-    for (let loc = 0; loc < 2; loc++) {
-      gl.enableVertexAttribArray(loc)
-      gl.vertexAttribPointer(loc, 4, gl.FLOAT, false, INSECT_STRIDE * 4, loc * 16)
+    const k = m.kernel
+    const bind = (unit, tex) => {
+      gl.activeTexture(gl.TEXTURE0 + unit)
+      gl.bindTexture(gl.TEXTURE_2D, tex)
     }
-    gl.bindVertexArray(this.vao)
-    this.pointSets.set(source, set)
-    return set
+    bind(UNIT_M_STATE, k.stateTexture)
+    bind(UNIT_M_AUX, k.auxTexture)
+    bind(UNIT_M_TRAITS, k.traitsTexture)
+    bind(UNIT_M_PREV, m.prev ?? k.stateTexture)
+    bind(UNIT_M_RANGE, k.genesTexture) // vision is gene 0 (species/midges.js), the first of each midge's geneTexels
+    bind(UNIT_M_ITEMS, m.pond.items.items)
+    bind(UNIT_M_NECTAR, m.pond.nectarTexture)
+    bind(UNIT_FLOWER_LOOK, m.pond.flowerLook)
+    bind(UNIT_M_AUX1, k.aux1Texture)
   }
 
-  /**
-   * Points in the insect style: the midges (with their eggs and ripples) or
-   * the dragonflies, each from its own buffer. See insectVS for the modes: 0
-   * on the water, 1 flying or perched, 2 shadows.
-   */
-  drawInsects(source, mode, time) {
+  /** The species texture layout uniforms of a midge program. */
+  midgeUniforms(u, m) {
     const gl = this.gl
-    const set = this.pointSet(source)
-    gl.bindVertexArray(set.vao)
-    if (source.version !== set.version) {
-      gl.bindBuffer(gl.ARRAY_BUFFER, set.buf)
-      gl.bufferData(gl.ARRAY_BUFFER, source.data, gl.DYNAMIC_DRAW)
-      set.version = source.version
-    }
-    const { program, u } = this.insectProg
-    gl.useProgram(program)
-    gl.uniform1i(u.u_mode, mode)
+    gl.uniform1i(u.u_mTexW, m.kernel.texW)
+    gl.uniform1i(u.u_mTexShift, m.kernel.texShift)
+    gl.uniform1i(u.u_mCount, m.kernel.count)
+    gl.uniform1i(u.u_mSelected, m.selected)
+    gl.uniform1i(u.u_rangeStride, m.kernel.geneTexels)
     gl.uniform2f(u.u_view, this.width, this.height)
     gl.uniform2fv(u.u_viewOffset, this.viewOffset)
     gl.uniform2fv(u.u_cell, this.cell)
+  }
+
+  /** Midges as points in the insect style (see insectVS for the modes: 0 on the water, 1 flying or perched, 2 shadows; midgeVS 3 ripples). */
+  drawMidges(m, mode, time, params) {
+    const gl = this.gl
+    this.bindMidges(m)
+    const { program, u } = this.midgeProg
+    gl.useProgram(program)
+    this.midgeUniforms(u, m)
+    gl.uniform1i(u.u_mode, mode)
     gl.uniform2fv(u.u_light, this.light)
     gl.uniform1f(u.u_elevCell, this.elevCell)
     gl.uniform2fv(u.u_elevDims, this.elevDims)
     gl.uniform1f(u.u_time, time)
-    gl.drawArrays(gl.POINTS, 0, source.points)
+    if (params) gl.uniform1f(u.u_bodyTime, params.insectBodyTime)
     gl.bindVertexArray(this.vao)
+    gl.drawArrays(gl.POINTS, 0, m.kernel.count)
   }
 
-  /** Motion trails of the flying insects ({ data, count, version }: GL_LINES vertices). */
-  drawTrails(trails) {
+  /** Each flying midge's path over this frame, fading out (they show when fast-forwarding). */
+  drawMidgeTrails(m, params) {
+    if (!m.prev) return
     const gl = this.gl
-    gl.bindVertexArray(this.trailVao)
-    if (trails.version !== this.trailVersion) {
-      gl.bindBuffer(gl.ARRAY_BUFFER, this.trailBuf)
-      gl.bufferData(gl.ARRAY_BUFFER, trails.data.subarray(0, trails.count * 6), gl.DYNAMIC_DRAW)
-      this.trailVersion = trails.version
+    this.bindMidges(m)
+    const { program, u } = this.midgeTrailProg
+    gl.useProgram(program)
+    this.midgeUniforms(u, m)
+    gl.uniform1f(u.u_maxHop, TRAIL_MAX_SPEED * m.frameTime + 4)
+    gl.uniform3fv(u.u_colour, MIDGE_TRAIL)
+    gl.uniform1f(u.u_alpha, TRAIL_ALPHA)
+    gl.bindVertexArray(this.vao)
+    gl.drawArrays(gl.LINES, 0, m.kernel.count * 2)
+  }
+
+  /** Midge range rings (all / selected), as fish's: the vision ring program, the radius from each midge's vision gene. */
+  drawMidgeRanges(m, params, sim) {
+    const gl = this.gl
+    const k = m.kernel
+    if (params.midgeVisionMode === 'selected' && m.selected < 0) return
+    const bind = (unit, tex) => {
+      gl.activeTexture(gl.TEXTURE0 + unit)
+      gl.bindTexture(gl.TEXTURE_2D, tex)
+    }
+    bind(UNIT_STATE, k.stateTexture)
+    bind(UNIT_AUX, k.auxTexture)
+    bind(UNIT_TRAITS, k.traitsTexture)
+    bind(UNIT_M_RANGE, k.genesTexture)
+    const ring = (offset, count, color, alpha) => {
+      const u = this.use(this.visionProg, k, offset)
+      gl.uniform1i(u.u_rangeFromTex, 1)
+      gl.uniform1i(u.u_rangeStride, k.geneTexels)
+      gl.uniform1i(u.u_aliveCheck, 1)
+      gl.uniform1f(u.u_radius, 0)
+      gl.uniform1f(u.u_cosHalfFov, -2)
+      gl.uniform1f(u.u_sepRatio, 0)
+      gl.uniform3fv(u.u_color, color)
+      gl.uniform1f(u.u_fill, 0)
+      gl.uniform1f(u.u_rim, alpha)
+      gl.uniform1i(u.u_rings, 1)
+      gl.uniform1f(u.u_band, Math.max(this.cell[0], this.cell[1]))
+      gl.uniform1f(u.u_halfSpan, Math.PI)
+      gl.drawArraysInstanced(gl.TRIANGLES, 0, 6 * S.RING_SEGMENTS, count)
+    }
+    if (params.midgeVisionMode === 'all') ring(0, k.count, VISION, rangeAlpha(k.count))
+    if (m.selected >= 0) ring(m.selected, 1, VISION_SELECTED, RANGE_SELECTED_ALPHA)
+    // The fish's textures back on their units.
+    bind(UNIT_STATE, sim.stateTexture)
+    bind(UNIT_AUX, sim.auxTexture)
+    bind(UNIT_TRAITS, sim.traitsTexture)
+    gl.useProgram(this.visionProg.program)
+    gl.uniform1i(this.visionProg.u.u_rangeFromTex, 0)
+    gl.uniform1i(this.visionProg.u.u_aliveCheck, 0)
+  }
+
+  /** What the selected midge sees: lines to the midges in its range, rings round the items it recognises. */
+  drawMidgeSeen(m) {
+    const gl = this.gl
+    this.bindMidges(m)
+    gl.bindVertexArray(this.vao)
+    let { program, u } = this.seenBoidsProg
+    gl.useProgram(program)
+    this.midgeUniforms(u, m)
+    gl.uniform4fv(u.u_colour, SEEN_MIDGES)
+    gl.drawArrays(gl.LINES, 0, m.kernel.count * 2)
+    const items = m.pond.items
+    if (!items.total) return
+    ;({ program, u } = this.seenItemsProg)
+    gl.useProgram(program)
+    this.midgeUniforms(u, m)
+    gl.uniform1i(u.u_itemsW, items.width)
+    gl.uniform1i(u.u_itemCount, items.total)
+    gl.uniform4fv(u['u_srcColour[0]'], m.seenStyles.colours)
+    gl.uniform1fv(u['u_srcRadius[0]'], m.seenStyles.radii)
+    gl.drawArrays(gl.LINES, 0, items.total * 24)
+  }
+
+  /**
+   * Lines in scene pixels ({ data, count, version }: GL_LINES vertices of x,
+   * y, premultiplied r, g, b, a): insect motion trails, midge vision rings.
+   */
+  drawLines(lines) {
+    const gl = this.gl
+    let set = this.lineSets.get(lines)
+    if (!set) {
+      set = { buf: gl.createBuffer(), vao: gl.createVertexArray(), version: -1 }
+      gl.bindVertexArray(set.vao)
+      gl.bindBuffer(gl.ARRAY_BUFFER, set.buf)
+      gl.enableVertexAttribArray(0)
+      gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 24, 0)
+      gl.enableVertexAttribArray(1)
+      gl.vertexAttribPointer(1, 4, gl.FLOAT, false, 24, 8)
+      this.lineSets.set(lines, set)
+    }
+    gl.bindVertexArray(set.vao)
+    if (lines.version !== set.version) {
+      gl.bindBuffer(gl.ARRAY_BUFFER, set.buf)
+      gl.bufferData(gl.ARRAY_BUFFER, lines.data.subarray(0, lines.count * 6), gl.DYNAMIC_DRAW)
+      set.version = lines.version
     }
     const { program, u } = this.trailProg
     gl.useProgram(program)
     gl.uniform2f(u.u_view, this.width, this.height)
     gl.uniform2fv(u.u_viewOffset, this.viewOffset)
     gl.uniform2fv(u.u_cell, this.cell)
-    gl.drawArrays(gl.LINES, 0, trails.count)
+    gl.drawArrays(gl.LINES, 0, lines.count)
     gl.bindVertexArray(this.vao)
   }
 
@@ -788,6 +922,15 @@ export class BoidRenderer {
     gl.uniform1f(u.u_litter, litter)
     gl.uniform1f(u.u_stones, stones)
     gl.uniform1f(u.u_twigs, twigs)
+    const [lx, ly] = this.light
+    const l = Math.hypot(lx, ly, 1)
+    gl.uniform3f(u.u_sun, -lx / l, -ly / l, 1 / l)
+    gl.uniform2fv(u.u_light, this.light)
+    gl.uniform1f(u.u_waterTint, this.waterTint ?? 0)
+    gl.uniform1f(u.u_tintCell, mapTex.tintCell)
+    gl.uniform2fv(u.u_tintDims, mapTex.tintDims)
+    gl.activeTexture(gl.TEXTURE0 + UNIT_TINT)
+    gl.bindTexture(gl.TEXTURE_2D, mapTex.tint)
     gl.disable(gl.BLEND)
     gl.drawArrays(gl.TRIANGLES, 0, 3)
     gl.enable(gl.BLEND)
@@ -797,11 +940,12 @@ export class BoidRenderer {
    * The scum pattern is static: render it once per map into a world-space
    * texture (one texel per frond cell) that drawScum() draws fronds from.
    */
-  bakeScum(mapTex) {
+  bakeScum(mapTex, amount, vegetation, amongPlants) {
     const gl = this.gl
     const map = mapTex.map
-    const key = `${mapTex.version}|${map.width}|${map.height}`
+    const key = `${mapTex.version}|${map.width}|${map.height}|${amount}|${vegetation.version}|${amongPlants}`
     if (key === this.scumKey) return
+    this.uploadPlantDensity(vegetation, map)
     const w = Math.max(1, Math.ceil(map.width / SCUM_CELL))
     const h = Math.max(1, Math.ceil(map.height / SCUM_CELL))
     gl.deleteTexture(this.scumBakeTex)
@@ -821,6 +965,10 @@ export class BoidRenderer {
     gl.uniform2fv(u.u_sdfExtent, mapTex.sdfExtent)
     gl.uniform1f(u.u_landLevel, LAND_LEVEL)
     gl.uniform2fv(u.u_seedOffset, mapTex.seedOffset)
+    gl.uniform1f(u.u_amount, amount)
+    gl.uniform1f(u.u_amongPlants, amongPlants)
+    gl.uniform1i(u.u_plantDensity, UNIT_PLANT_DENSITY)
+    gl.uniform1f(u.u_densityCell, PLANT_DENSITY_CELL)
     gl.disable(gl.BLEND)
     gl.drawArrays(gl.TRIANGLES, 0, 3)
     gl.enable(gl.BLEND)
@@ -828,6 +976,47 @@ export class BoidRenderer {
     gl.bindTexture(gl.TEXTURE_2D, this.scumBakeTex)
     this.readScumSpots(w, h)
     this.scumKey = key
+  }
+
+  /**
+   * How crowded with plants each PLANT_DENSITY_CELL px cell is (0..1: plant
+   * bases nearby, blurred), so the scum can keep out of the reeds or crowd
+   * into them (params.scumAmongPlants).
+   */
+  uploadPlantDensity(vegetation, map) {
+    const gl = this.gl
+    const C = PLANT_DENSITY_CELL
+    const w = Math.max(1, Math.ceil(map.width / C))
+    const h = Math.max(1, Math.ceil(map.height / C))
+    let grid = new Float32Array(w * h)
+    for (let i = 0; i < vegetation.count; i++) {
+      const o = i * PLANT_STRIDE
+      const x = Math.floor(vegetation.data[o] / C)
+      const y = Math.floor(vegetation.data[o + 1] / C)
+      if (x >= 0 && y >= 0 && x < w && y < h) grid[y * w + x]++
+    }
+    // Two 3x3 box blurs: about a 5-cell soft footprint per plant.
+    for (let pass = 0; pass < 2; pass++) {
+      const next = new Float32Array(w * h)
+      for (let y = 0; y < h; y++) {
+        for (let x = 0; x < w; x++) {
+          let sum = 0
+          for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) sum += grid[Math.min(h - 1, Math.max(0, y + dy)) * w + Math.min(w - 1, Math.max(0, x + dx))]
+          next[y * w + x] = sum / 9
+        }
+      }
+      grid = next
+    }
+    const px = new Uint8Array(w * h)
+    for (let k = 0; k < px.length; k++) px[k] = Math.round(255 * Math.min(1, grid[k] / PLANT_DENSITY_FULL))
+    gl.activeTexture(gl.TEXTURE0 + UNIT_PLANT_DENSITY)
+    gl.deleteTexture(this.plantDensityTex)
+    this.plantDensityTex = createTexture(gl, gl.R8, w, h)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1)
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, w, h, gl.RED, gl.UNSIGNED_BYTE, px)
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4)
   }
 
   /**
@@ -963,8 +1152,12 @@ export class BoidRenderer {
     gl.uniform1i(u.u_cloudsOn, params.showClouds ? 1 : 0)
     gl.uniform2fv(u.u_cloudShift, this.cloudShift)
     gl.uniform2fv(u.u_wind, this.wind)
+    gl.uniform4fv(u.u_windPair, this.windPair)
+    gl.uniform1f(u.u_windMix, this.windMix)
+    gl.uniform2fv(u.u_windTravel, this.windTravel)
+    gl.uniform2fv(u.u_causticShift, this.causticShift)
     // The cloud speed doubles as wind strength: stronger wind, livelier ripples.
-    gl.uniform1f(u.u_windStrength, 0.4 + 0.6 * Math.min(1, params.cloudSpeed / 40))
+    gl.uniform1f(u.u_windStrength, 0.4 + 0.6 * Math.min(1, this.windSpeed / 40))
     if (surface) gl.uniform2fv(u.u_swayExtent, sway.extent)
     gl.bindVertexArray(this.vao)
     if (!surface) gl.disable(gl.BLEND)
@@ -990,32 +1183,13 @@ export class BoidRenderer {
     const gl = this.gl
     const n = vegetation.count
     const src = vegetation.data
-    const counts = new Array(PLANT_KINDS.length).fill(0)
-    for (let i = 0; i < n; i++) counts[src[i * PLANT_STRIDE + 4]]++
-    const starts = []
-    let acc = 0
-    for (const c of counts) {
-      starts.push(acc)
-      acc += c
-    }
-    const cursor = [...starts]
+    const { slot, starts, counts } = plantSlots(vegetation)
     const rows = Math.max(1, Math.ceil((n * 2) / PLANT_TEX_W))
     const sorted = new Float32Array(rows * PLANT_TEX_W * 4)
-    // Where each plant went, for the bloom texture.
-    this.plantSlot = new Int32Array(n)
-    for (let i = 0; i < n; i++) {
-      const k = src[i * PLANT_STRIDE + 4]
-      this.plantSlot[i] = cursor[k]
-      sorted.set(src.subarray(i * PLANT_STRIDE, (i + 1) * PLANT_STRIDE), cursor[k]++ * PLANT_STRIDE)
-    }
+    for (let i = 0; i < n; i++) sorted.set(src.subarray(i * PLANT_STRIDE, (i + 1) * PLANT_STRIDE), slot[i] * PLANT_STRIDE)
     gl.deleteTexture(this.plantTex)
     this.plantTex = createTexture(gl, gl.RGBA32F, PLANT_TEX_W, rows)
     gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, PLANT_TEX_W, rows, gl.RGBA, gl.FLOAT, sorted)
-    const bloomRows = Math.max(1, Math.ceil(n / PLANT_TEX_W))
-    this.bloomSorted = new Float32Array(bloomRows * PLANT_TEX_W)
-    gl.deleteTexture(this.bloomTex)
-    this.bloomTex = createTexture(gl, gl.R32F, PLANT_TEX_W, bloomRows)
-    this.bloomVersion = -1
     this.plantBatches = PLANT_KINDS.map((k, i) => ({
       start: starts[i],
       count: counts[i],
@@ -1025,24 +1199,10 @@ export class BoidRenderer {
     this.plantVersion = vegetation.version
   }
 
-  /** How much nectar each flower holds (vegetation.bloom), in plant order. */
-  uploadBloom(vegetation) {
-    const gl = this.gl
-    const sorted = this.bloomSorted
-    const slot = this.plantSlot
-    const bloom = vegetation.bloom
-    for (let i = 0; i < slot.length; i++) sorted[slot[i]] = bloom[i]
-    gl.activeTexture(gl.TEXTURE0 + UNIT_BLOOM)
-    gl.bindTexture(gl.TEXTURE_2D, this.bloomTex)
-    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, PLANT_TEX_W, sorted.length / PLANT_TEX_W, gl.RED, gl.FLOAT, sorted)
-    this.bloomVersion = vegetation.bloomVersion
-  }
-
   drawPlants(vegetation, sway, time, shadowPass = false) {
     if (!vegetation.count) return
     const gl = this.gl
     if (vegetation.version !== this.plantVersion) this.uploadPlants(vegetation)
-    if (vegetation.bloomVersion !== this.bloomVersion) this.uploadBloom(vegetation)
     const { program, u } = this.plantProg
     gl.useProgram(program)
     gl.uniform2f(u.u_resolution, this.width, this.height)
@@ -1053,10 +1213,14 @@ export class BoidRenderer {
     gl.uniform1i(u.u_shadowPass, shadowPass ? 1 : 0)
     gl.uniform2fv(u.u_light, shadowPass ? this.light : [0, 0])
     gl.uniform2fv(u.u_wind, this.wind)
+    gl.uniform4fv(u.u_windPair, this.windPair)
+    gl.uniform1f(u.u_windMix, this.windMix)
     gl.activeTexture(gl.TEXTURE0 + UNIT_PLANTS)
     gl.bindTexture(gl.TEXTURE_2D, this.plantTex)
     gl.activeTexture(gl.TEXTURE0 + UNIT_BLOOM)
-    gl.bindTexture(gl.TEXTURE_2D, this.bloomTex)
+    gl.bindTexture(gl.TEXTURE_2D, this.nectarTex) // gpu/PondGpu.js: nectar in plant-slot order (r)
+    gl.activeTexture(gl.TEXTURE0 + UNIT_FLOWER_LOOK)
+    gl.bindTexture(gl.TEXTURE_2D, this.flowerLookTex)
     gl.bindVertexArray(this.vao)
     // Level of detail: at coarse pixel sizes most blades are sub-pixel and
     // indistinguishable, so draw fewer of them.
@@ -1071,53 +1235,25 @@ export class BoidRenderer {
     }
   }
 
-  drawField(field) {
-    const gl = this.gl
-    gl.activeTexture(gl.TEXTURE0 + UNIT_FIELD)
-    gl.bindTexture(gl.TEXTURE_2D, this.fieldTex)
-    if (field.version !== this.fieldVersion) {
-      const size = field.cols * field.rows * 4
-      if (this.fieldPixels.length !== size) this.fieldPixels = new Uint8Array(size)
-      field.toRGBA(this.fieldPixels)
-      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1)
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, field.cols, field.rows, 0, gl.RGBA, gl.UNSIGNED_BYTE, this.fieldPixels)
-      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4)
-      this.fieldVersion = field.version
-    }
-    const fp = this.fieldProg
-    gl.useProgram(fp.program)
-    const extentX = field.cols * field.cellSize
-    const extentY = field.rows * field.cellSize
-    gl.uniform2f(fp.u.u_uvScale, this.width / extentX, this.height / extentY)
-    gl.uniform2f(fp.u.u_uvOffset, this.viewOffset[0] / extentX, this.viewOffset[1] / extentY)
-    gl.drawArrays(gl.TRIANGLES, 0, 3)
-  }
-
   destroy() {
     const gl = this.gl
     for (const p of this.programs) gl.deleteProgram(p.program)
     gl.deleteBuffer(this.tuneBuf)
-    gl.deleteTexture(this.fieldTex)
     gl.deleteTexture(this.sceneTex)
     gl.deleteFramebuffer(this.sceneFbo)
     gl.deleteTexture(this.bgTex)
     gl.deleteFramebuffer(this.bgFbo)
     gl.deleteBuffer(this.padBuf)
     gl.deleteVertexArray(this.padVao)
-    for (const set of this.pointSets.values()) {
+    for (const set of this.lineSets.values()) {
       gl.deleteBuffer(set.buf)
       gl.deleteVertexArray(set.vao)
     }
-    gl.deleteBuffer(this.trailBuf)
-    gl.deleteVertexArray(this.trailVao)
     gl.deleteTexture(this.plantTex)
-    gl.deleteTexture(this.bloomTex)
     gl.deleteTexture(this.scumBakeTex)
     gl.deleteFramebuffer(this.scumBakeFbo)
     gl.deleteTexture(this.scumLayerTex)
     gl.deleteFramebuffer(this.scumLayerFbo)
-    gl.deleteTexture(this.shadeTex)
-    gl.deleteFramebuffer(this.shadeFbo)
     gl.deleteTexture(this.maskTex)
     gl.deleteFramebuffer(this.maskFbo)
     gl.deleteTexture(this.blankTex)
