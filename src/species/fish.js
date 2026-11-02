@@ -6,17 +6,26 @@ export const BOID_COLORS = ['gold', 'blue', 'white', 'orange', 'black']
 /** Candidates a fish looks at, per neighbour it may count: bounds the cost in crowds. */
 const SCAN_PER_NEIGHBOR = 6
 
+/** Vertical swimming: how hard a fish's depth springs to where it wants to be (1/s²), the damping (1/s), its fastest climb or dive as a share of its top speed, and how far its depth wanders (share of the water depth). */
+const VERT_SPRING = 6
+const VERT_DAMP = 5
+const VERT_MAX = 0.6
+const DEPTH_WANDER = 0.08
+
 /**
  * Fish as a species of the GPU base boid (gpu/boids/BoidKernel.js): no genome
- * yet (their behaviour is the global params), traits (colour, swim depth as a
- * fraction of the water depth, tail-beat phase offset), aux (steering ax, ay,
- * neighbours + swim depth now, tail phase).
+ * yet (their behaviour is the global params), traits (colour, preferred swim
+ * depth as a fraction of the water depth, tail-beat phase offset), aux
+ * (steering ax, ay, neighbours, tail phase), vert (z: px below the surface,
+ * negative; vz).
  *
  * They see their own kind in a cone (`fov`) within `perception`: alignment,
  * cohesion and separation, each Reynolds steering weighted by its param; then
- * the shore and trunks in their way, seen with rays fanned across the field
- * of view, steer them to the clearest water; they swim at their own depth,
- * over or under trunks.
+ * the shore and trunks in their way at their depth, seen with rays fanned
+ * across the field of view, steer them to the clearest water. Vertically each
+ * swims towards its preferred depth (wandering a little, slowly), or over or
+ * under a trunk ahead; its depth follows on a damped spring at a capped rate,
+ * so a trunk is solid until it has actually risen or dived past it.
  */
 /** What a fish recognises (for the focus legend). */
 export const FISH_SENSES = [{ key: 'fish', label: 'Fish', kind: 'flock' }]
@@ -34,6 +43,7 @@ export const FISH = {
     ['total', 'acc'],
   ],
   modeChannel: -1, // no modes: every fish is in the grid
+  vertical: true,
   /** The largest range it sees within (sets the grid cell). */
   maxRange: (p) => p.perception,
   /** Fastest a fish moves (px/s), with room for the shore pushing it. */
@@ -67,7 +77,7 @@ export const FISH = {
     gl.uniform1f(u.u_bodySize, p.boidSize)
   },
   /** The selected fish for the panel, from its state, aux, traits (one texel each). */
-  describe: (s, a, tr) => ({ color: BOID_COLORS[tr[0]], speed: Math.hypot(s[2], s[3]), steering: Math.hypot(a[0], a[1]), neighbors: Math.floor(a[2]) }),
+  describe: (s, a, tr, genome, time, p, v) => ({ color: BOID_COLORS[tr[0]], speed: Math.hypot(s[2], s[3]), steering: Math.hypot(a[0], a[1]), neighbors: Math.floor(a[2]), position: [s[0], s[1], v?.[0] ?? 0], velocity: [s[2], s[3], v?.[1] ?? 0] }),
   /** A fresh fish at (x, y): state, aux, traits, genome. */
   spawn(x, y, p) {
     const a = Math.random() * Math.PI * 2
@@ -76,6 +86,7 @@ export const FISH = {
       state: [x, y, Math.cos(a) * v, Math.sin(a) * v],
       aux: [0, 0, 0, 0],
       traits: [Math.floor(Math.random() * BOID_COLORS.length), Math.random(), Math.random(), 0],
+      vert: [-2, 0, 0, 0], // just under the surface: it dives to its depth
     }
   },
   glsl: {
@@ -104,6 +115,10 @@ uniform vec3 u_weights; // alignment, cohesion, separation
 uniform float u_wallWeight;
 uniform float u_beat;      // tail-beat frequency multiplier
 uniform float u_bodySize;  // drawn size: the snout is 1.6x this ahead of the centre, the tail fin's end 1.75x behind
+const float VERT_SPRING = ${VERT_SPRING.toFixed(2)};
+const float VERT_DAMP = ${VERT_DAMP.toFixed(2)};
+const float VERT_MAX = ${VERT_MAX.toFixed(2)};
+const float DEPTH_WANDER = ${DEPTH_WANDER.toFixed(3)};
 float shoreAt(vec2 p) { return texture(u_sdf, p / u_sdfExtent).r; }
 vec2 inwardAt(vec2 p) {
   vec2 e = vec2(u_sdfCell, 0.0);
@@ -217,10 +232,12 @@ vec2 steer(vec2 target, vec2 v) {
   float aLimit = u_maxForce * 2.0;
   if (am > aLimit) acc *= aLimit / am;
 
-  // The fish's elevation: its own depth as a fraction of the water below it.
-  float floorE = floorAt(pos);
-  float swim = texelFetch(u_traits, own, 0).y;
-  float zf = u_landLevel * (1.0 - swim * clamp((u_landLevel - floorE) / u_landLevel, 0.0, 1.0));
+  // The fish's elevation now, from its height (px below the surface).
+  vec4 traits = texelFetch(u_traits, own, 0);
+  float swim = traits.y;
+  float z = vert.x;
+  float vz = vert.y;
+  float zf = u_landLevel + z * u_logElevPerPx;
   // Trunks within sight that are in the way at this fish's depth.
   int near[MAX_NEAR_LOGS];
   int nearCount = 0;
@@ -303,11 +320,12 @@ vec2 steer(vec2 target, vec2 v) {
   }
 
   o_state = vec4(pos, vel);
-  // Where it swims now (rising over or diving under trunks), as a fraction of
-  // the water depth, rides in the fraction of the neighbour count for the renderer.
+  // Where it wants to swim: its own depth (wandering slowly about it) as a
+  // share of the water below, or over or under a trunk in the way.
   float floorNow = floorAt(pos);
   float waterNow = clamp((u_landLevel - floorNow) / u_landLevel, 0.0, 1.0);
-  float zOwn = u_landLevel * (1.0 - swim * waterNow);
+  float wander = DEPTH_WANDER * sin(u_time * (0.08 + 0.06 * traits.z) + traits.z * 40.0);
+  float zOwn = u_landLevel * (1.0 - clamp(swim + wander, 0.02, 0.98) * waterNow);
   float zNow = swimDepthNear(pos, zOwn, floorNow, near, nearCount);
   if (nearCount > 0) {
     // The whole body passes the trunk at one depth: also ask at the snout and
@@ -322,11 +340,22 @@ vec2 steer(vec2 target, vec2 v) {
     if (abs(zHead - zOwn) > abs(zNow - zOwn)) zNow = zHead;
     if (abs(zTail - zOwn) > abs(zNow - zOwn)) zNow = zTail;
   }
-  float swimNow = clamp((u_landLevel - zNow) / max(u_landLevel - floorNow, 1e-4), 0.0, 0.999);
+  // Its depth follows on a damped spring, no faster than VERT_MAX of its top
+  // speed, between the floor and the surface.
+  float zWant = (zNow - u_landLevel) / u_logElevPerPx;
+  vz += ((zWant - z) * VERT_SPRING - vz * VERT_DAMP) * u_dt;
+  vz = clamp(vz, -u_maxSpeed * VERT_MAX, u_maxSpeed * VERT_MAX);
+  z += vz * u_dt;
+  float bottom = -0.999 * max(u_landLevel - floorNow, 0.0) / u_logElevPerPx;
+  if (z < bottom || z > -0.5) {
+    z = clamp(z, bottom, -0.5);
+    vz = 0.0;
+  }
+  o_vert = vec4(z, vz, 0.0, 0.0);
   // Tail beat: integrated, so a change of speed changes the rate, never the
   // pose. Faster fish beat faster.
   float phase = texelFetch(u_aux, own, 0).w + u_dt * 6.2832 * u_beat * (1.5 + length(vel) * 0.03);
-  o_aux = vec4(acc, float(count) + swimNow, mod(phase, 6.2832));
+  o_aux = vec4(acc, float(count), mod(phase, 6.2832));
 `,
   },
 }

@@ -20,7 +20,8 @@ Most boid demos fix their rules and tune them by hand. Here, as little as possib
 
 - Thousands of boids simulated entirely on the GPU (WebGL2 fragment-shader GPGPU): spatial hashing, sorting and neighbour search with a vision cone.
 - Steering by alignment, cohesion and separation, plus avoiding the shore, banks and islands.
-- Animated swimming (tail beat and body undulation), swim depth, and murk that fades deeper fish.
+- Animated swimming (tail beat and body undulation), and murk that fades deeper fish.
+- Every creature has a real height (z, with its vertical speed) as well as its place on the map: 0 is the water surface, below is negative. Fish swim at their own depth, wandering slowly up and down and rising over or diving under trunks at a limited rate, and a trunk is solid until they have actually cleared it. Midges fly at a height above the water. Click one to see its position and velocity in x, y and z.
 - Per-fish traits already live in a GPU texture with room for a genome.
 
 **Where it's heading:** fish get genomes like the insects have, covering behaviour (how they school, forage, flee and rest) and body (size, shape, fins, colour). Body traits will cost and gain something real in the pond, such as speed against energy, or size against hiding among plants. The fish then feed on the midges and are hunted in turn, so both behaviour and bodies evolve against a living, shifting ecosystem.
@@ -34,6 +35,10 @@ Most boid demos fix their rules and tune them by hand. Here, as little as possib
 - Flying burns energy, more the faster. A hungry midge that touches a flower with nectar stops on it and drinks. It leaves after its eat-time gene's seconds, when the flower runs dry, or when its flock or the things it senses pull hard enough.
 - With energy above its laying gene, scum draws it, and the further above, the harder. Touching scum, it lays an egg there, which costs 30% of its energy. The egg hatches after a set time (the Midges tab, World section) into a midge with a mutated copy of its genome.
 - Past the lifespan (a slider), every second it gets slower and burns more energy, each by a multiplier you set, until it starves of old age. Otherwise it dies when its energy runs out. What selects is how many eggs a midge lays before then.
+- It flies at the height its flight-height gene sets, climbing and sinking at a limited rate. Hungry with a flower it likes in sight, or ready to lay with scum in sight, it glides down, because it can only land or lay when it is low. The wind carries it harder the higher it flies.
+- It sees rain within its vision: how much of what it sees is under rain clouds, and which way there is more. A rain gene steers it towards or away from the rain. A raindrop falling through a flying midge kills it, and these are the same drops drawn on the water.
+- Its urge to rest is a rest gene plus four inputs, each weighed by a gene of its own: hunger, the urge to lay, the rain it sees, and a threat (fish moving in the water under it). Above 0 it comes down and rests where it is, on the water or the ground. Resting it burns little and is safe from rain, but it neither eats nor lays. It takes off once the urge drops below −0.15.
+- Click a midge to see what it weighs, live: its inputs, the genes they pass through, and what they drive (steering, rest, height). Each line is green for a positive value and red for a negative one.
 - Laying an egg on the water, or falling there dead, sends out a small round ripple.
 
 ### Dragonflies
@@ -48,6 +53,7 @@ Removed for now: they will be remade on the shared base boid.
 - Lily colonies come in pink, white or yellow, with open blooms and buds.
 - The Pond tab sets how much of the map is land (same map, floor raised or lowered), the water depth, and how far the scum spreads, including how far it creeps in among the plants.
 - Sun and moving cloud shadows (which the creatures react to), wind (it wanders around the set direction and speed, changing gradually every so often), ripples, caustics and refraction.
+- Rain (Weather): by default it starts and stops by itself, with showers and dry spells taking turns (how often it rains and how long showers last are sliders). The rain toggle shows whether it is raining, and flipping it takes the rain over by hand. The clouds thicken and darken over a few seconds, and while it rains its strength drifts around a set strength. Each drop is a real point that lands under a cloud. Its ring spreads over the water, from a midge's ripple up to three times its size, and stays whole even where it spreads into sunlight. The midges' sim uses the very same drops.
 - Resizing the window keeps the world while it still fits (only the view is cropped), so a fullscreen browser showing its toolbar does not reset the pond. A bigger window lays it out again.
 - **New map** lays out new shores and a new floor. **Randomize world** keeps the map's shape but rerolls its conditions: the plant mix, water depth, colour (peaty blue-green to muddy brown) and murk, trunks, floor details, sun, wind and clouds. Varying the world is how the creatures are kept from fitting one pond.
 
@@ -104,6 +110,7 @@ A species is one definition file in `src/species/` that the GPU base boid (`src/
 - `glsl`: its own code. `pre` sets how far it sees, `visit` runs for each neighbour, and `act` turns the senses into forces and moves it.
 - `forces`: the force vectors to show. The selected boid's arrows and legend come from these.
 - `spawn`, `describe`, `alive`: how a new one starts, how the selected one is described in the panel, and whether it counts as alive.
+- `signals` (optional): `[key, glsl]` scalars the selected boid's debug pass writes out alongside its forces (midges: hunger, urge to lay, rain seen, threat, urge to rest, target height), which the panel uses for the gene diagram. `glsl.sense` (optional) is extra sensing that runs with the flock and items, on its sensing ticks.
 - `lays` and `egg` (optional): births. The shader marks a lay in `aux1`, and `engine/Laying.js` reads it back and places an egg (`egg()`, with a mutated copy of the genome) in a free slot. Midges use this.
 
 Range rings, selection, the force overlay, profiles and stats come from the base for free.

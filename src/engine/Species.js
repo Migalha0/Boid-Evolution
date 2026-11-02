@@ -75,15 +75,15 @@ export class Species {
     if (!stepped) return // paused: the last forces stay
     this.readback.read(k.debugFbo, this.gl.COLOR_ATTACHMENT0, 0, 0, k.layout.width, 1, (d) => {
       if (this.selected !== i) return
-      const { forces, seen, pos } = k.decodeDebug(d)
+      const { forces, seen, signals, pos } = k.decodeDebug(d)
       this.focus.clear()
       this.focus.forces(pos[0], pos[1], forces)
       this.focus.version++
-      this.senses = { seen, forces: Object.fromEntries(Object.entries(forces).map(([key, [x, y]]) => [key, Math.hypot(x, y)])) }
+      this.senses = { seen, signals, forces: Object.fromEntries(Object.entries(forces).map(([key, [x, y]]) => [key, Math.hypot(x, y)])) }
     })
   }
 
-  /** The selected one's state, aux, traits and genome (one texel each), described by the definition. */
+  /** The selected one's state, aux, traits, genome and vert (one texel each), described by the definition. */
   readSelected() {
     const k = this.kernel
     const i = this.selected
@@ -96,13 +96,14 @@ export class Species {
     const y = i >> k.texShift
     const got = {}
     const done = () => {
-      if (this.selected !== i || !got.state || !got.aux || !got.traits || !got.genes) return
+      if (this.selected !== i || !got.state || !got.aux || !got.traits || !got.genes || (k.vertical && !got.vert)) return
       const genome = this.def.genes.map((_, g) => got.genes[g])
-      this.selectedInfo = { index: i, id: i, generation: 0, senses: this.senses, ...this.def.describe(got.state, got.aux, got.traits, genome, k.time, k.params) }
+      this.selectedInfo = { index: i, id: i, generation: 0, senses: this.senses, ...this.def.describe(got.state, got.aux, got.traits, genome, k.time, k.params, got.vert) }
     }
     this.readback.read(k.currentFbo, gl.COLOR_ATTACHMENT0, x, y, 1, 1, (v) => ((got.state = v), done()))
     this.readback.read(k.currentFbo, gl.COLOR_ATTACHMENT1, x, y, 1, 1, (v) => ((got.aux = v), done()))
     this.readback.read(k.traitsFbo, gl.COLOR_ATTACHMENT0, x, y, 1, 1, (v) => ((got.traits = v), done()))
+    if (k.vertical) this.readback.read(k.currentFbo, k.vertAttachment, x, y, 1, 1, (v) => ((got.vert = v), done()))
     const T = k.geneTexels
     this.readback.read(k.genesFbo, gl.COLOR_ATTACHMENT0, x * T, y, T, 1, (v) => ((got.genes = v), done()))
   }

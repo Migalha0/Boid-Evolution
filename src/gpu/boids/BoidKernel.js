@@ -33,8 +33,6 @@ function sharedPrograms(gl) {
     sortLocal: createProgram(gl, S.passVS, S.sortLocalFS),
     rank: createProgram(gl, S.passVS, S.rankFS),
     scatter: createProgram(gl, S.scatterVS, S.scatterFS),
-    writeBack: createProgram(gl, S.writeBackVS(1), S.writeBackFS(1)),
-    writeBack2: createProgram(gl, S.writeBackVS(2), S.writeBackFS(2)),
   }
   const bind = (prog, units) => {
     gl.useProgram(prog.program)
@@ -48,8 +46,17 @@ function sharedPrograms(gl) {
   bind(progs.rank, { u_keys: 0 })
   bind(progs.scatter, { u_ranks: 0, u_state: 1, u_keys: 2 })
   bind(progs.sortLocal, { u_keys: 0 })
-  bind(progs.writeBack, { u_nextState: 0, u_nextAux: 1, u_sortedKeys: 2 })
-  bind(progs.writeBack2, { u_nextState: 0, u_nextAux: 1, u_sortedKeys: 2, u_nextAux1: 3 })
+  // Write-back per set of extra outputs (aux1, vert), made on first use.
+  progs.writeBack = (extras) => {
+    const key = `writeBack:${extras.join(',')}`
+    if (!progs[key]) {
+      progs[key] = createProgram(gl, S.writeBackVS(extras), S.writeBackFS(extras))
+      const units = { u_nextState: 0, u_nextAux: 1, u_sortedKeys: 2 }
+      extras.forEach((n, i) => (units[`u_next${n[0].toUpperCase()}${n.slice(1)}`] = 3 + i))
+      bind(progs[key], units)
+    }
+    return progs[key]
+  }
   shared.set(gl, progs)
   return progs
 }
@@ -80,6 +87,10 @@ function sharedPrograms(gl) {
  *   state   RGBA32F (x, y, vx, vy)    ping-pong
  *   aux     RGBA32F species-defined   ping-pong
  *   aux1    RGBA32F species-defined   ping-pong, if def.auxTextures is 2
+ *   vert    RGBA32F (z, vz, -, -)    ping-pong, if def.vertical: height in
+ *           world px (0 the water surface, + up into the air, - down into
+ *           the water) and its rate. The grid stays top-down (x, y): the
+ *           vertical axis is each boid's own (neighbours are not seen in z)
  *   traits  RGBA32F per-boid constants
  *   genes   RGBA32F, geneTexels (ceil(genes / 4)) texels side by side per
  *           boid, so one texture (one unit) for any genome
@@ -105,9 +116,13 @@ export class BoidKernel {
     this.lookAll = true // memories new or stale: everyone looks on the next step
     this.geneTexels = Math.max(1, Math.ceil(def.genes.length / 4))
     this.auxCount = def.auxTextures ?? 1
+    this.vertical = !!def.vertical
+    // Outputs after state and aux, in attachment order (writeBack and the framebuffers).
+    this.extras = [...(this.auxCount > 1 ? ['aux1'] : []), ...(this.vertical ? ['vert'] : [])]
     const units = { u_sortedKeys: UNIT.sortedKeys, u_sorted: UNIT.sorted, u_cellTable: UNIT.cellTable, u_prevState: UNIT.prevState, u_aux: UNIT.aux, u_traits: UNIT.traits, u_genes: UNIT.genes }
     let unit = Object.keys(UNIT).length
     if (this.auxCount > 1) units.u_aux1 = unit++
+    if (this.vertical) units.u_vert = unit++
     for (let t = 0; t < (this.look?.textures ?? 0); t++) units[`u_look${t}`] = unit++
     for (const name of def.textures) units[name] = unit++
     if (unit > gl.getParameter(gl.MAX_TEXTURE_IMAGE_UNITS)) throw new Error(`${def.name}: ${unit} textures, more than this GPU binds at once`)
@@ -148,6 +163,14 @@ export class BoidKernel {
   get aux1Texture() {
     return this.particle.aux1[this.cur]
   }
+  /** (z, vz, -, -) per boid, if def.vertical. */
+  get vertTexture() {
+    return this.particle.vert[this.cur] ?? null
+  }
+  /** The current framebuffer's attachment holding vert (if def.vertical). */
+  get vertAttachment() {
+    return this.gl.COLOR_ATTACHMENT0 + 2 + this.extras.indexOf('vert')
+  }
   get traitsTexture() {
     return this.particle.traits
   }
@@ -158,7 +181,7 @@ export class BoidKernel {
   get genesFbo() {
     return this.particle.genesFbo
   }
-  /** Framebuffer with the current state (attachment 0), aux (1) and aux1 (2, if any). */
+  /** Framebuffer with the current state (attachment 0), aux (1), then aux1 and vert (if any). */
   get currentFbo() {
     return this.particle.fbo[this.cur]
   }
@@ -210,6 +233,7 @@ export class BoidKernel {
           state: this.readSync(this.currentFbo, gl.COLOR_ATTACHMENT0, keep),
           aux: this.readSync(this.currentFbo, gl.COLOR_ATTACHMENT1, keep),
           aux1: this.auxCount > 1 ? this.readSync(this.currentFbo, gl.COLOR_ATTACHMENT2, keep) : null,
+          vert: this.vertical ? this.readSync(this.currentFbo, this.vertAttachment, keep) : null,
           traits: this.readSync(this.traitsFbo, gl.COLOR_ATTACHMENT0, keep),
           genes: this.readSync(this.genesFbo, gl.COLOR_ATTACHMENT0, keep, this.geneTexels),
         }
@@ -221,10 +245,11 @@ export class BoidKernel {
     const state = [tex(gl.RGBA32F), tex(gl.RGBA32F)]
     const aux = [tex(gl.RGBA32F), tex(gl.RGBA32F)]
     const aux1 = this.auxCount > 1 ? [tex(gl.RGBA32F), tex(gl.RGBA32F)] : []
+    const vert = this.vertical ? [tex(gl.RGBA32F), tex(gl.RGBA32F)] : []
     const keys = [tex(gl.R32UI), tex(gl.R32UI)]
     const sorted = tex(gl.RGBA32F)
     const sortedKeys = tex(gl.R32UI)
-    const next = Array.from({ length: 1 + this.auxCount }, () => tex(gl.RGBA32F))
+    const next = Array.from({ length: 2 + this.extras.length }, () => tex(gl.RGBA32F))
     const traits = tex(gl.RGBA32F)
     const genes = createTexture(gl, gl.RGBA32F, w * this.geneTexels, h)
     // What each last sensed: not kept on reallocating (everyone looks again on the next step).
@@ -236,6 +261,7 @@ export class BoidKernel {
       state,
       aux,
       aux1,
+      vert,
       keys,
       sorted,
       sortedKeys,
@@ -244,7 +270,7 @@ export class BoidKernel {
       genes,
       look,
       lookFbo: look.length ? createFramebuffer(gl, look) : null,
-      fbo: [0, 1].map((k) => createFramebuffer(gl, [state[k], aux[k], ...aux1.slice(k, k + 1)])),
+      fbo: [0, 1].map((k) => createFramebuffer(gl, [state[k], aux[k], ...aux1.slice(k, k + 1), ...vert.slice(k, k + 1)])),
       keyFbo: [createFramebuffer(gl, [keys[0]]), createFramebuffer(gl, [keys[1]])],
       sortedFbo: createFramebuffer(gl, [sorted, sortedKeys]),
       sortedStateFbo: createFramebuffer(gl, [sorted]),
@@ -267,6 +293,7 @@ export class BoidKernel {
       uploadRange(gl, state[0], w, 0, old.state)
       uploadRange(gl, aux[0], w, 0, old.aux)
       if (old.aux1) uploadRange(gl, aux1[0], w, 0, old.aux1)
+      if (old.vert) uploadRange(gl, vert[0], w, 0, old.vert)
       uploadRange(gl, traits, w, 0, old.traits)
       uploadRange(gl, genes, w * this.geneTexels, 0, old.genes)
     }
@@ -300,19 +327,21 @@ export class BoidKernel {
     this.grid = null
   }
 
-  /** Boids as def.spawn makes them ({ state, aux, aux1, traits, genome }) into slots start.. on. */
+  /** Boids as def.spawn makes them ({ state, aux, aux1, vert, traits, genome }) into slots start.. on. */
   upload(start, boids) {
     const n = boids.length
     const T = this.geneTexels
     const state = new Float32Array(n * 4)
     const aux = new Float32Array(n * 4)
     const aux1 = new Float32Array(n * 4)
+    const vert = new Float32Array(n * 4)
     const traits = new Float32Array(n * 4)
     const genes = new Float32Array(n * T * 4)
     boids.forEach((b, i) => {
       state.set(b.state, i * 4)
       aux.set(b.aux, i * 4)
       if (b.aux1) aux1.set(b.aux1, i * 4)
+      if (b.vert) vert.set(b.vert, i * 4)
       traits.set(b.traits, i * 4)
       if (b.genome) genes.set(b.genome, i * T * 4)
     })
@@ -320,6 +349,7 @@ export class BoidKernel {
     uploadRange(this.gl, this.stateTexture, w, start, state)
     uploadRange(this.gl, this.auxTexture, w, start, aux)
     if (this.auxCount > 1) uploadRange(this.gl, this.aux1Texture, w, start, aux1)
+    if (this.vertical) uploadRange(this.gl, this.vertTexture, w, start, vert)
     uploadRange(this.gl, this.traitsTexture, w, start, traits)
     uploadRange(this.gl, this.genesTexture, w * T, start * T, genes)
   }
@@ -406,6 +436,7 @@ export class BoidKernel {
     this.bindTex(u.u_traits, P.traits)
     this.bindTex(u.u_genes, P.genes)
     if (this.auxCount > 1) this.bindTex(u.u_aux1, P.aux1[this.cur])
+    if (this.vertical) this.bindTex(u.u_vert, P.vert[this.cur])
     const own = this.def.bindTextures(ctx)
     for (const name of this.def.textures) this.bindTex(u[name], own[name])
   }
@@ -485,12 +516,12 @@ export class BoidKernel {
     }
 
     // back to each boid's own texel -> other ping-pong side
-    const writeBack = this.auxCount > 1 ? this.progs.writeBack2 : this.progs.writeBack
+    const writeBack = this.progs.writeBack(this.extras)
     this.begin(writeBack, P.fbo[1 - this.cur], P.w, P.h)
     this.bindTex(0, P.next[0])
     this.bindTex(1, P.next[1])
     this.bindTex(2, P.sortedKeys)
-    if (this.auxCount > 1) this.bindTex(3, P.next[2])
+    this.extras.forEach((_, i) => this.bindTex(3 + i, P.next[2 + i]))
     gl.uniform2f(writeBack.u.u_dims, P.w, P.h)
     gl.drawArrays(gl.POINTS, 0, n)
 
@@ -597,7 +628,7 @@ export class BoidKernel {
 
   /**
    * The debug pass's result as { forces: { key: [x, y] }, seen: { key: n },
-   * pos, vel } from its raw texels (Readback of debugFbo, layout.width wide).
+   * signals: { key: value }, pos, vel } from its raw texels (Readback of debugFbo, layout.width wide).
    */
   decodeDebug(d) {
     const L = this.layout
@@ -605,15 +636,17 @@ export class BoidKernel {
     this.def.forces.forEach(([key], k) => (forces[key] = [d[k * 2], d[k * 2 + 1]]))
     const seen = {}
     L.senses.forEach((key, k) => (seen[key === 'flock' ? this.def.senses.find((s) => s.kind === 'flock').key : key] = d[L.forceTexels * 4 + k]))
+    const signals = {}
+    L.signals.forEach((key, k) => (signals[key] = d[(L.forceTexels + L.countTexels) * 4 + k]))
     const o = L.stateTexel * 4
-    return { forces, seen, pos: [d[o], d[o + 1]], vel: [d[o + 2], d[o + 3]] }
+    return { forces, seen, signals, pos: [d[o], d[o + 1]], vel: [d[o + 2], d[o + 3]] }
   }
 
   freeParticles() {
     const P = this.particle
     if (!P) return
     const gl = this.gl
-    for (const t of [...P.state, ...P.aux, ...P.aux1, ...P.keys, ...P.next, P.sorted, P.sortedKeys, P.traits, P.ranks, P.genes, ...P.look]) gl.deleteTexture(t)
+    for (const t of [...P.state, ...P.aux, ...P.aux1, ...P.vert, ...P.keys, ...P.next, P.sorted, P.sortedKeys, P.traits, P.ranks, P.genes, ...P.look]) gl.deleteTexture(t)
     for (const f of [...P.fbo, ...P.keyFbo, P.sortedFbo, P.sortedStateFbo, P.nextFbo, P.traitsFbo, P.ranksFbo, P.genesFbo, P.lookFbo]) gl.deleteFramebuffer(f)
     this.particle = null
   }

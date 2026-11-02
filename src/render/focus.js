@@ -14,6 +14,7 @@ export const FORCES = [
   { key: 'scum', label: 'Scum', hex: '#a3e635' },
   { key: 'pads', label: 'Lily pads', hex: '#2dd4bf' },
   { key: 'laying', label: 'Laying (to scum)', hex: '#fb923c' },
+  { key: 'rain', label: 'Rain', hex: '#93c5fd' },
   { key: 'propulsion', label: 'Propulsion', hex: '#e879f9' },
   { key: 'seek', label: 'Seek target', hex: '#4ade80' },
   { key: 'spacing', label: 'Spacing', hex: '#f87171' },

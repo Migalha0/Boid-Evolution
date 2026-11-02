@@ -3,6 +3,25 @@ const EASE = 10
 /** At full variability, how far one change turns the wind (degrees) and how far its speed strays from the set speed (fraction). */
 const MAX_TURN = 90
 const MAX_GUST = 1
+/** Wind-shaped patterns (cloud wisps, ripples) use fixed directions this far apart (degrees), blending between two. */
+const PATTERN_WIND_STEP = 30
+
+/** Unit vector the wind blows towards; direction in degrees clockwise from north (screen up). */
+export function windVector(direction) {
+  const a = (direction * Math.PI) / 180
+  return [Math.sin(a), -Math.cos(a)]
+}
+
+/**
+ * The two fixed directions a wind-shaped pattern is drawn for, either side of
+ * `direction` ([A.x, A.y, B.x, B.y]), and how far from A to B it is (0..1)
+ * (render/shaders.js windA, windB, u_windMix).
+ */
+export function windPattern(direction) {
+  const step = direction / PATTERN_WIND_STEP
+  const k = Math.floor(step)
+  return { pair: [...windVector(k * PATTERN_WIND_STEP), ...windVector((k + 1) * PATTERN_WIND_STEP)], mix: step - k }
+}
 
 /**
  * The wind as it blows now. Manual (params windAuto off): exactly the set
@@ -16,6 +35,7 @@ export class Wind {
   constructor() {
     this.direction = null // degrees, clockwise from north (screen up)
     this.speed = 0 // px/s
+    this.shift = [0, 0]
   }
 
   /** Fastest it can blow with these params (px/s). */
@@ -24,6 +44,13 @@ export class Wind {
   }
 
   update(dt, p) {
+    this.blow(dt, p)
+    const [x, y] = windVector(this.direction)
+    this.shift[0] += x * this.speed * dt
+    this.shift[1] += y * this.speed * dt
+  }
+
+  blow(dt, p) {
     if (!p.windAuto || this.direction == null) {
       this.direction = p.windDirection
       this.speed = p.cloudSpeed

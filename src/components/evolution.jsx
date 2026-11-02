@@ -83,6 +83,20 @@ export function HowTheyLive({ food, breeding, breedingTitle }) {
   )
 }
 
+/**
+ * A selected creature's position and velocity in 3D, as world px and px/s:
+ * x right, y down the screen, z up (0 the water surface, negative under it).
+ */
+export function Vectors({ position, velocity }) {
+  if (!position || !velocity) return null
+  const row = (v, digits) => v.map((c) => c.toFixed(digits).padStart(7)).join('')
+  return (
+    <pre className="font-mono text-[10px] leading-snug text-amber-200/90" title="x right, y down the screen, z up (0 is the water surface, negative is under it)">
+      {`${''.padEnd(5)}${['x', 'y', 'z'].map((a) => a.padStart(7)).join('')}\npos  ${row(position, 0)}  px\nvel  ${row(velocity, 1)}  px/s`}
+    </pre>
+  )
+}
+
 /** Genes as a compact table; `spread` adds ± columns, `compare` a second genome alongside. */
 export function GeneTable({ genes, spread, compare, compareLabel, list }) {
   return (

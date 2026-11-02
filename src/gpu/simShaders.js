@@ -212,40 +212,42 @@ void main() {
 `
 
 // 6. One point per boid: the update's results (sorted order) back to the
-// boid's own texel.
-export const writeBackVS = (aux) => /* glsl */ `${HEADER}
+// boid's own texel: state and aux, then a species' extra outputs (`extras`,
+// names such as 'aux1' and 'vert', each u_next<Name> -> o_<name>).
+const cap = (n) => n[0].toUpperCase() + n.slice(1)
+export const writeBackVS = (extras = []) => /* glsl */ `${HEADER}
 uniform sampler2D u_nextState;
 uniform sampler2D u_nextAux;
-${aux > 1 ? 'uniform sampler2D u_nextAux1;' : ''}
+${extras.map((n) => `uniform sampler2D u_next${cap(n)};`).join('\n')}
 uniform usampler2D u_sortedKeys;
 uniform vec2 u_dims;
 flat out vec4 v_state;
 flat out vec4 v_aux;
-${aux > 1 ? 'flat out vec4 v_aux1;' : ''}
+${extras.map((n) => `flat out vec4 v_${n};`).join('\n')}
 void main() {
   ivec2 k = coordOf(gl_VertexID);
   v_state = texelFetch(u_nextState, k, 0);
   v_aux = texelFetch(u_nextAux, k, 0);
-  ${aux > 1 ? 'v_aux1 = texelFetch(u_nextAux1, k, 0);' : ''}
+  ${extras.map((n) => `v_${n} = texelFetch(u_next${cap(n)}, k, 0);`).join('\n  ')}
   ivec2 own = coordOf(int(texelFetch(u_sortedKeys, k, 0).x & ID_MASK));
   gl_Position = vec4((vec2(own) + 0.5) / u_dims * 2.0 - 1.0, 0.0, 1.0);
   gl_PointSize = 1.0;
 }
 `
 
-/** Write-back for a species with `aux` aux textures (1 or 2). */
-export const writeBackFS = (aux) => /* glsl */ `#version 300 es
+/** Write-back for a species with these extra outputs after state and aux (writeBackVS). */
+export const writeBackFS = (extras = []) => /* glsl */ `#version 300 es
 precision highp float;
 flat in vec4 v_state;
 flat in vec4 v_aux;
-${aux > 1 ? 'flat in vec4 v_aux1;' : ''}
+${extras.map((n) => `flat in vec4 v_${n};`).join('\n')}
 layout(location = 0) out vec4 o_state;
 layout(location = 1) out vec4 o_aux;
-${aux > 1 ? 'layout(location = 2) out vec4 o_aux1;' : ''}
+${extras.map((n, i) => `layout(location = ${i + 2}) out vec4 o_${n};`).join('\n')}
 void main() {
   o_state = v_state;
   o_aux = v_aux;
-  ${aux > 1 ? 'o_aux1 = v_aux1;' : ''}
+  ${extras.map((n) => `o_${n} = v_${n};`).join('\n  ')}
 }
 `
 

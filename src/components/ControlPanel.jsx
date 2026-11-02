@@ -4,7 +4,7 @@ import { PLANT_KINDS, plantAmountKey } from '../sim/Vegetation.js'
 import { FADE_TRANSITION, FADED, useIdleFade } from './useIdleFade.js'
 import { Hint, LogSlider, RangeModes, Section, Slider, TickRate, Toggle } from './controls.jsx'
 import { FISH_SENSES } from '../species/fish.js'
-import { ForceLegend, dangerButton } from './evolution.jsx'
+import { ForceLegend, Vectors, dangerButton } from './evolution.jsx'
 import { MidgeTab, SelectedMidge } from './MidgePanel.jsx'
 
 /** Knob sweep for value dials (range mode): -135°..135°, gap at the bottom. */
@@ -195,6 +195,7 @@ export default function ControlPanel({ params, setParam, stats, onReset, onNewMa
               <div>speed {stats.selected.speed.toFixed(1)} px/s</div>
               <div>steering {stats.selected.steering.toFixed(1)} px/s²</div>
               <div>neighbours {stats.selected.neighbors}</div>
+              <Vectors position={stats.selected.position} velocity={stats.selected.velocity} />
               <ForceLegend senses={stats.selected.senses} list={FISH_SENSES} />
             </div>
           )}
@@ -451,6 +452,36 @@ export default function ControlPanel({ params, setParam, stats, onReset, onNewMa
                 )}
                 <Toggle label="Clouds" checked={p.showClouds} onChange={(v) => setParam('showClouds', v)} />
                 <Slider label="Cloud cover" value={p.cloudCover} min={0} max={1} step={0.01} onChange={(v) => setParam('cloudCover', v)} />
+                <Toggle label="Rain comes and goes by itself" checked={p.rainAuto} onChange={(v) => {
+                  // Taking over by hand: it keeps raining (or not) as it is now.
+                  if (!v && stats.raining != null) setParam('rain', stats.raining)
+                  setParam('rainAuto', v)
+                }} />
+                {/* In auto the toggle follows the rain as it falls; flipping it takes the rain over by hand. */}
+                <Toggle
+                  label={p.rainAuto ? 'Raining (now)' : 'Rain'}
+                  checked={p.rainAuto ? !!stats.raining : p.rain}
+                  onChange={(v) => (setParam('rainAuto', false), setParam('rain', v))}
+                />
+                {p.rainAuto && (
+                  <>
+                    <Slider label="How often it rains" value={p.rainFrequency} min={0} max={1} step={0.05} onChange={(v) => setParam('rainFrequency', v)} unit=" of the time" />
+                    <Slider label="Showers last" value={p.rainSpell} min={10} max={600} step={10} onChange={(v) => setParam('rainSpell', v)} unit=" s" />
+                  </>
+                )}
+                {(p.rainAuto || p.rain) && (
+                  <>
+                    <Slider label={`Rain strength${stats.rain ? ` (now ${Math.round(stats.rain * 100)}%)` : ''}`} value={p.rainStrength} min={0.05} max={1} step={0.05} onChange={(v) => setParam('rainStrength', v)} />
+                    <Slider label="How much it changes" value={p.rainVariability} min={0} max={1} step={0.05} onChange={(v) => setParam('rainVariability', v)} />
+                    <Slider label="Changes every" value={p.rainChangeEvery} min={5} max={300} step={5} onChange={(v) => setParam('rainChangeEvery', v)} unit=" s" />
+                  </>
+                )}
+                <Hint>
+                  {p.rainAuto
+                    ? 'Showers and dry spells take turns by themselves, about as often and as long as set (each varied); flip the rain toggle to set it by hand. '
+                    : 'It rains while the toggle is on. Switch on the first toggle to let it start and stop by itself. '}
+                  The clouds thicken and darken over a few seconds, and drops fall from them: each lands somewhere under a cloud (anywhere with clouds off) and its ring spreads over the water. A drop falling through a flying midge kills it. While it rains, its strength drifts around the set strength. Rings are shown with water motion on.
+                </Hint>
               </Section>
               <Section title="Cloud shape" fold>
                 <Slider label="Size" value={p.cloudSize} min={300} max={4000} step={50} onChange={(v) => setParam('cloudSize', v)} unit=" px" />

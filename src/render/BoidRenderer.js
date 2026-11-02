@@ -3,6 +3,8 @@ import { SCUM_CELL } from '../gpu/ScumField.js'
 import { PAD_STRIDE } from '../sim/LilyPads.js'
 import { LAND_LEVEL } from '../sim/PondMap.js'
 import { MAX_KINDS, PLANT_KINDS, PLANT_STRIDE, plantSlots } from '../sim/Vegetation.js'
+import { cloudTune } from '../sim/Rain.js'
+import { windPattern, windVector } from '../sim/Wind.js'
 import { createCloudTexture } from './clouds.js'
 import * as S from './shaders.js'
 
@@ -29,10 +31,10 @@ const TUNABLES = [
   (p) => 1 - p.plantSelfShadow, // PLANT_SELF_SHADE
   (p) => p.murkSurface,
   (p) => p.murkDeep,
-  (p) => 1 / p.cloudSize, // CLOUD_SCALE
-  (p) => 0.65 - 0.4 * p.cloudCover, // CLOUD_COVER threshold
-  (p) => p.cloudSoftness, // CLOUD_EDGE
-  (p) => 1 - p.cloudDarkness, // CLOUD_SHADE
+  (p, r) => r.clouds[0], // CLOUD_SCALE
+  (p, r) => r.clouds[1], // CLOUD_COVER threshold (thicker in the rain: sim/Rain.js cloudTune)
+  (p, r) => r.clouds[2], // CLOUD_EDGE
+  (p, r) => r.clouds[3], // CLOUD_SHADE (darker in the rain)
   (p) => p.swirlStrength,
   (p) => p.swirlSize,
   (p) => p.swirlSpeed,
@@ -60,6 +62,7 @@ const TUNE_BINDING = 0
 // Texture units: sim state/aux are bound once per frame and shared by all programs.
 const UNIT_STATE = 0
 const UNIT_AUX = 1
+const UNIT_VERT = 2 // the boid's vert (z, vz): fish depth, midge height; bound per draw (each species its own)
 const UNIT_TRAITS = 3
 const UNIT_ELEV = 4
 const UNIT_SCENE = 5
@@ -105,14 +108,6 @@ const PLANT_DENSITY_FULL = 1.5
 /** Frond cells drawn beyond each side of the view: fronds drift up to 30 px (ScumField). */
 const SCUM_MARGIN_CELLS = 12
 
-/** Wind-shaped patterns (cloud wisps, ripples) use fixed directions this far apart (degrees), blending between two. */
-const PATTERN_WIND_STEP = 30
-
-/** Unit vector the wind blows towards; direction in degrees clockwise from north (screen up). */
-function windVector(direction) {
-  const a = (direction * Math.PI) / 180
-  return [Math.sin(a), -Math.cos(a)]
-}
 
 /**
  * Shadow offset per px of height, away from the sun.
@@ -220,6 +215,7 @@ export class BoidRenderer {
     gl.uniform1i(this.waterProg.u.u_tint, UNIT_TINT)
     gl.uniform1i(this.waterProg.u.u_trunks, UNIT_TRUNKS)
     gl.useProgram(this.boidProg.program)
+    gl.uniform1i(this.boidProg.u.u_vert, UNIT_VERT)
     gl.uniform1i(this.boidProg.u.u_trunks, UNIT_TRUNKS)
     gl.uniform1i(this.boidProg.u.u_elev, UNIT_ELEV)
     gl.uniform1i(this.boidProg.u.u_silt, UNIT_SILT)
@@ -262,7 +258,7 @@ export class BoidRenderer {
     gl.uniform1i(this.postProg.u.u_clouds, UNIT_CLOUDS)
     gl.activeTexture(gl.TEXTURE0 + UNIT_CLOUDS)
     this.cloudTex = createCloudTexture(gl)
-    this.cloudShift = [0, 0]
+    this.cloudShift = [0, 0] // how far the clouds have drifted (world px): the live wind's (sim/Wind.js)
     this.windTravel = [0, 0] // how far the wind has blown (unit vector x s), for patterns drifting with it
     this.causticShift = [0, 0] // how far the caustics have drifted downwind (noise tiles)
     this.cloudTime = null
@@ -294,6 +290,7 @@ export class BoidRenderer {
     this.scumBakeTex = null
     this.scumBakeFbo = null
     this.light = [0, 0]
+    this.rain = 0 // 0 dry .. 1 downpour: the live rain's (sim/Rain.js)
 
     this.viewOffset = [0, 0]
     this.pixelSize = 0
@@ -348,6 +345,7 @@ export class BoidRenderer {
       gl.uniform1i(prog.u.u_nectar, UNIT_M_NECTAR)
       gl.uniform1i(prog.u.u_flowerLook, UNIT_FLOWER_LOOK)
       gl.uniform1i(prog.u.u_mAux1, UNIT_M_AUX1)
+      gl.uniform1i(prog.u.u_mVert, UNIT_VERT)
     }
     gl.useProgram(this.visionProg.program)
     gl.uniform1i(this.visionProg.u.u_rangeTex, UNIT_M_RANGE)
@@ -435,10 +433,10 @@ export class BoidRenderer {
     const wind = this.liveWind?.direction != null ? this.liveWind : { direction: params.windDirection, speed: params.cloudSpeed }
     this.wind = windVector(wind.direction)
     this.windSpeed = wind.speed
-    const step = wind.direction / PATTERN_WIND_STEP
-    const k = Math.floor(step)
-    this.windPair = [...windVector(k * PATTERN_WIND_STEP), ...windVector((k + 1) * PATTERN_WIND_STEP)]
-    this.windMix = step - k
+    const pattern = windPattern(wind.direction)
+    this.windPair = pattern.pair
+    this.windMix = pattern.mix
+    if (this.liveWind) this.cloudShift = this.liveWind.shift
     this.floatHeight = params.floatHeight
     this.elevCell = mapTex.elevCell
     this.elevDims = mapTex.elevDims
@@ -446,7 +444,9 @@ export class BoidRenderer {
     this.floorKey = `${params.murkSurface}|${params.murkDeep}|${params.showPlants ? params.sludgeAmount : 0}|${params.floorLitter}|${params.floorStones}|${params.floorTwigs}|${params.sunAzimuth}|${params.sunElevation}|${params.waterTint}|${params.depthEffect}`
     this.floorDetails = [params.floorLitter, params.floorStones, params.floorTwigs]
     this.waterTint = params.waterTint
-    TUNABLES.forEach((f, i) => (this.tuneData[i] = f(params)))
+    this.rain = this.liveRain?.level ?? 0
+    this.clouds = cloudTune(params, this.rain)
+    TUNABLES.forEach((f, i) => (this.tuneData[i] = f(params, this)))
     gl.bindBuffer(gl.UNIFORM_BUFFER, this.tuneBuf)
     gl.bufferSubData(gl.UNIFORM_BUFFER, 0, this.tuneData)
     gl.bindBufferBase(gl.UNIFORM_BUFFER, TUNE_BINDING, this.tuneBuf)
@@ -526,6 +526,8 @@ export class BoidRenderer {
     }
 
     const drawBoids = (offset, count, mode, size, shift = [0, 0], tint = [1, 1, 1]) => {
+      gl.activeTexture(gl.TEXTURE0 + UNIT_VERT)
+      gl.bindTexture(gl.TEXTURE_2D, sim.vertTexture)
       const u = this.use(this.boidProg, sim, offset)
       gl.uniform1f(u.u_size, size)
       gl.uniform2fv(u.u_shift, shift)
@@ -602,8 +604,10 @@ export class BoidRenderer {
   advanceClouds(speed, causticSpeed, time) {
     const dt = Math.max(0, time - (this.cloudTime ?? time))
     this.cloudTime = time
-    this.cloudShift[0] += this.wind[0] * speed * dt
-    this.cloudShift[1] += this.wind[1] * speed * dt
+    if (!this.liveWind) {
+      this.cloudShift[0] += this.wind[0] * speed * dt
+      this.cloudShift[1] += this.wind[1] * speed * dt
+    }
     this.windTravel[0] += this.wind[0] * dt
     this.windTravel[1] += this.wind[1] * dt
     // Caustics drift downwind as fast as they used to slide (about causticSpeed tiles per s).
@@ -700,6 +704,7 @@ export class BoidRenderer {
     bind(UNIT_M_NECTAR, m.pond.nectarTexture)
     bind(UNIT_FLOWER_LOOK, m.pond.flowerLook)
     bind(UNIT_M_AUX1, k.aux1Texture)
+    bind(UNIT_VERT, k.vertTexture)
   }
 
   /** The species texture layout uniforms of a midge program. */
@@ -1158,7 +1163,12 @@ export class BoidRenderer {
     gl.uniform2fv(u.u_causticShift, this.causticShift)
     // The cloud speed doubles as wind strength: stronger wind, livelier ripples.
     gl.uniform1f(u.u_windStrength, 0.4 + 0.6 * Math.min(1, this.windSpeed / 40))
-    if (surface) gl.uniform2fv(u.u_swayExtent, sway.extent)
+    if (surface) {
+      gl.uniform2fv(u.u_swayExtent, sway.extent)
+      gl.uniform1f(u.u_rain, this.rain > 0.01 ? this.rain : 0)
+      gl.uniform2fv(u.u_cell, this.cell)
+      gl.uniform2f(u.u_cloudVel, this.wind[0] * this.windSpeed, this.wind[1] * this.windSpeed)
+    }
     gl.bindVertexArray(this.vao)
     if (!surface) gl.disable(gl.BLEND)
     gl.drawArrays(gl.TRIANGLES, 0, 3)

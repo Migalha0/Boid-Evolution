@@ -42,6 +42,13 @@ export const DEFAULT_PARAMS = {
   windVariability: 0.4, // auto wind: 0 = steady; up to 1, each change turns it up to ±90°, speed 0..2x the set speed
   windChangeEvery: 40, // seconds (on average) between the wind settling on a new direction and strength
   cloudCover: 0.45, // 0 = clear sky .. 1 = overcast
+  rain: false, // rain by hand (rainAuto off): the clouds thicken and darken, and drops fall from them (rippling the water, killing midges they hit)
+  rainAuto: true, // the rain starts and stops by itself (else it rains while rain is on)
+  rainFrequency: 0.25, // auto: share of the time it rains
+  rainSpell: 90, // auto: seconds a shower lasts (on average; dry spells last as long as the share needs)
+  rainStrength: 0.6, // 0 drizzle .. 1 downpour, on average
+  rainVariability: 0.5, // 0 = steady; up to 1, each change takes it from none to twice the strength
+  rainChangeEvery: 30, // seconds (on average) between showers and lulls
   cloudSize: 1400, // world px per cloud noise tile
   cloudSoftness: 0.1, // width of the wispy cloud edges
   cloudDarkness: 0.2, // fraction of light a cloud core blocks

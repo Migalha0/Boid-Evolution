@@ -13,6 +13,7 @@ import { PLANT_KINDS, plantAmountKey } from '../sim/Vegetation.js'
 import { LilyPads } from '../sim/LilyPads.js'
 import { PondMap } from '../sim/PondMap.js'
 import { BoidRenderer } from '../render/BoidRenderer.js'
+import { Rain } from '../sim/Rain.js'
 import { Wind } from '../sim/Wind.js'
 import { Laying } from './Laying.js'
 import { Species } from './Species.js'
@@ -53,6 +54,7 @@ export class Engine {
     this.pads = new LilyPads(this.map)
     this.time = 0
     this.wind = new Wind()
+    this.rain = new Rain()
     this.history = [] // [time, fish, midges]
     this.historyClock = 0
     // Midges: how many the last flock had, and their stats.
@@ -117,6 +119,7 @@ export class Engine {
     this.scum = new ScumField(gl)
     this.renderer = new BoidRenderer(gl)
     this.renderer.liveWind = this.wind
+    this.renderer.liveRain = this.rain
     this.pondScumVersion = -1 // scum spots for the midges come from the renderer
     this.simTimer = new GpuTimer(gl)
     this.renderTimer = new GpuTimer(gl)
@@ -366,7 +369,19 @@ export class Engine {
       for (let k = 0; k < steps; k++) {
         this.time += dt
         this.wind.update(dt, this.params)
-        const ctx = { params: this.params, mapTex: this.mapTex, pond: this.pond, laying: this.laying, wind: this.wind, time: this.time }
+        this.rain.update(dt, this.params)
+        const ctx = {
+          params: this.params,
+          mapTex: this.mapTex,
+          pond: this.pond,
+          laying: this.laying,
+          wind: this.wind,
+          rain: this.rain,
+          rainCell: this.renderer.cell ?? [1, 1], // the drops' grid, as the water draws them
+          clouds: this.renderer.cloudTex,
+          sway: this.sway,
+          time: this.time,
+        }
         this.sim.step(dt, ctx)
         if (midges) {
           this.pond.updateFlowers(dt, this.params, this.time)
@@ -444,10 +459,12 @@ export class Engine {
     if (!this.params.showInsects) return
     this.midges.readAll(({ alive, population, state, aux }) => {
       let eating = 0
+      let resting = 0
       const cells = new Map()
       for (let i = 0; i < k.count; i++) {
         const mode = aux[i * 4 + 1]
         if (mode === MODE.onFlower) eating++
+        if (mode === MODE.resting) resting++
         if (mode !== MODE.flying) continue
         const c = Math.floor(state[i * 4] / SWARM_CELL) * 4096 + Math.floor(state[i * 4 + 1] / SWARM_CELL)
         cells.set(c, (cells.get(c) ?? 0) + 1)
@@ -463,11 +480,12 @@ export class Engine {
       this.midgeStats = {
         alive,
         eating,
+        restingMidges: resting,
         swarms,
         eggs: L.eggs,
         laid: L.laid,
         hatched: L.hatched,
-        deaths: { starved: L.deaths[DEATH.starved] ?? 0, old: L.deaths[DEATH.old] ?? 0 },
+        deaths: { starved: L.deaths[DEATH.starved] ?? 0, old: L.deaths[DEATH.old] ?? 0, rain: L.deaths[DEATH.rain] ?? 0 },
         ...(this.flowerStats ?? { dry: 0, resting: 0, flowers: 0 }),
         time: this.time,
         extinctions: this.midgeExtinctions,
@@ -518,7 +536,7 @@ export class Engine {
     this.statsTicks = (this.statsTicks ?? 0) + 1
     if (this.statsTicks % 4 === 0) this.readMidgeStats() // about once a second
     const gpuSimMs = this.params.paused ? 0 : this.simTimer.ms
-    const midgeStats = this.params.showInsects ? (this.midgeStats ?? { alive: this.midgeSim.count, eating: 0, swarms: 0, eggs: 0, laid: 0, hatched: 0, deaths: { starved: 0, old: 0 }, dry: 0, resting: 0, flowers: 0, time: this.time, extinctions: this.midgeExtinctions, extinct: false, history: this.midgeHistory.slice(), population: null }) : null
+    const midgeStats = this.params.showInsects ? (this.midgeStats ?? { alive: this.midgeSim.count, eating: 0, restingMidges: 0, swarms: 0, eggs: 0, laid: 0, hatched: 0, deaths: { starved: 0, old: 0, rain: 0 }, dry: 0, resting: 0, flowers: 0, time: this.time, extinctions: this.midgeExtinctions, extinct: false, history: this.midgeHistory.slice(), population: null }) : null
     this.onStats?.({
       fps,
       gpuSimMs,
@@ -526,6 +544,8 @@ export class Engine {
       frameMs: timed ? (gpuSimMs ?? 0) + this.renderTimer.ms : this.frameMs,
       count: this.sim.count,
       wind: { direction: this.wind.direction ?? this.params.windDirection, speed: this.wind.speed },
+      rain: this.rain.level,
+      raining: this.rain.on,
       midges: midgeStats && { ...midgeStats, selected: this.midges.selected >= 0 ? this.midges.selectedInfo : null },
       selected: this.fish.selected >= 0 ? this.fish.selectedInfo : null,
       history: this.history.slice(),

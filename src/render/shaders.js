@@ -3,6 +3,7 @@ import { LAND_LEVEL } from '../sim/PondMap.js'
 /** Seconds a ripple ring lasts (insectFS). */
 const RIPPLE_LIFE = 0.9
 import { LAND_FLAG } from '../sim/Vegetation.js'
+import { RAIN_GLSL } from '../sim/Rain.js'
 
 // Boid data is read straight from the simulation textures with texelFetch,
 // indexed by gl_InstanceID; geometry comes from gl_VertexID. No vertex buffers.
@@ -209,14 +210,15 @@ float logDistance(vec2 p, float far) {
 // change shape as they go), domain-warped so the outlines curl. Cores are the
 // densest; towards the edges density falls off and breaks into streaks
 // stretched along the wind, so the edges are wispy and lighter.
-const CLOUDS = /* glsl */ `${TUNE}
+//
+// CLOUD_FIELD is the cloud density alone, also read by the midges' sim (rain
+// falls from the clouds: species/midges.js), so it needs CLOUD_SCALE,
+// CLOUD_COVER and CLOUD_EDGE defined (TUNE here; plain uniforms there).
+export const CLOUD_FIELD = /* glsl */ `
 uniform sampler2D u_clouds;  // tiling noise (clouds.js)
-uniform vec2 u_cloudShift;   // how far the wind has carried the clouds (world px)
-uniform vec2 u_wind;         // unit vector the wind blows towards
+uniform vec2 u_cloudShift;   // how far the wind has carried the clouds (world px: sim/Wind.js shift)
 uniform vec4 u_windPair;     // the two fixed directions the wind is between (A.xy, B.xy)
 uniform float u_windMix;     // how far from A to B it is, 0..1
-uniform vec2 u_windTravel;   // how far the wind has blown (integral of u_wind dt, s)
-uniform vec2 u_causticShift; // how far the caustics have drifted downwind (caustic noise tiles)
 
 float cloud(vec2 p) { return texture(u_clouds, p).r; }
 
@@ -238,10 +240,10 @@ float cloudStreak(vec2 p, vec2 s, vec2 wd) {
   return smoothstep(0.3, 0.7, streak);
 }
 
-// 0 = clear sky .. 1 = cloud core.
-float cloudCover(vec2 world) {
+// 0 = clear sky .. 1 = cloud core, with the clouds carried by shift (world px).
+float cloudCoverAt(vec2 world, vec2 shift) {
   vec2 p = world * CLOUD_SCALE;
-  vec2 s = u_cloudShift * CLOUD_SCALE;
+  vec2 s = shift * CLOUD_SCALE;
   // Slow, large warp: curls the outlines.
   vec2 warp = vec2(cloud(p * 0.6 - s * 0.7 + 0.13), cloud(p * 0.6 - s * 0.7 + 0.71)) - 0.5;
   vec2 q = p + warp * 0.18;
@@ -256,7 +258,14 @@ float cloudCover(vec2 world) {
   float streak = mix(cloudStreak(p, s, windA()), cloudStreak(p, s, windB()), u_windMix);
   return d * mix(streak, 1.0, d * d);
 }
+float cloudCover(vec2 world) { return cloudCoverAt(world, u_cloudShift); }
 `
+
+const CLOUDS = /* glsl */ `${TUNE}
+uniform vec2 u_wind;         // unit vector the wind blows towards
+uniform vec2 u_windTravel;   // how far the wind has blown (integral of u_wind dt, s)
+uniform vec2 u_causticShift; // how far the caustics have drifted downwind (caustic noise tiles)
+${CLOUD_FIELD}`
 
 // Koi palette: gold, blue, white, orange, black (order = BOID_COLORS in species/fish.js).
 // The fish is a little spine mesh built from gl_VertexID: 4 body segments
@@ -303,11 +312,13 @@ out float v_blur;   // 0 = crisp .. 1 = deep fish, out of focus
 out vec3 v_body;    // body: (along, across from the spine, half-width there), in body sizes
 out float v_halo;   // how far the blur reaches past the outline (body sizes; 0 = crisp)
 out vec2 v_soft;  // shadow: position in its soft blob (0 = centre, 1 = faded out)
+uniform sampler2D u_vert; // (z, vz, -, -): z px below the surface (negative)
 const float LAND = ${LAND_LEVEL.toFixed(4)};
 const float ELEV_PER_PX = ${LOG_ELEV_PER_PX.toFixed(6)};
 void main() {
   vec4 s = boidState();
   vec4 aux = boidAux();
+  float z = texelFetch(u_vert, coordOf(boidId()), 0).x;
   vec4 traits = boidTraits();
   v_swimDepth = -1.0;
   v_soft = vec2(0.0);
@@ -315,9 +326,9 @@ void main() {
   v_halo = 0.0;
   vec2 f, r; float m;
   basisFrom(s.zw, f, r, m);
-  // Where it swims now, rising over or diving under trunks (the sim's aux.z fraction).
-  float swim = fract(aux.z);
+  // Where it swims now, as a share of the water below it (its height z, px).
   float floorE = texture(u_elev, (s.xy / u_elevCell + 0.5) / u_elevDims).r;
+  float swim = clamp(-z * ELEV_PER_PX / max(LAND - floorE, 1e-4), 0.0, 0.999);
   float depth = clamp((LAND - floorE) / LAND, 0.0, 1.0); // water depth here, 0..1
   // Deep fish are out of focus: the mesh grows by the blur's reach past the
   // true outline (on every side, the snout too) and boidFS fades the halo
@@ -1987,10 +1998,43 @@ uniform vec2 u_viewOffset;
 uniform float u_time;
 uniform bool u_cloudsOn;
 uniform float u_windStrength;
+uniform float u_rain;     // 0 dry .. 1 downpour (sim/Rain.js level)
+uniform vec2 u_cell;      // world px per scene pixel
+uniform vec2 u_cloudVel;  // world px/s the clouds drift
 out vec4 o;
 ${CLOUDS}
 ${RIPPLES}
 const vec3 GLINT = vec3(0.82, 0.86, 0.8);
+const vec3 RAIN_RING = vec3(0.75, 0.8, 0.7); // as a midge's ripple
+
+// Raindrops (sim/Rain.js RAIN_GLSL, the drops the midges are hit by): rings
+// like the midges' (insectFS state 7: 1.5 px out to 7 over RIPPLE_LIFE s,
+// fading) out to 7..21 scene px, spreading as fast. A pixel looks at the
+// 3x3 cells around it per layer; a drop counts only if it landed under a
+// cloud, as the clouds were then (back-dated by their drift), so a ring stays
+// whole over sunlit water and never pops off as a cloud's edge passes.
+${RAIN_GLSL}
+float rainRings(vec2 q, float t) {
+  float a = 0.0;
+  for (int layer = 0; layer < 2; layer++) {
+    ivec2 base = rainCellOf(q, layer);
+    for (int j = -1; j <= 1; j++) {
+      for (int i = -1; i <= 1; i++) {
+        vec2 at;
+        float age, R;
+        if (!rainDrop(base + ivec2(i, j), layer, t, u_rain, at, age, R)) continue;
+        float life = RAIN_LIFE * R / RAIN_MIN;
+        if (age > life) continue;
+        float r = 1.5 + age / life * (R - 1.5);
+        float fade = 0.4 * (1.0 - age / life);
+        if (abs(length(q - at) - r) >= 0.5 || fade <= a) continue;
+        if (u_cloudsOn && cloudCoverAt(at * u_cell, u_cloudShift - u_cloudVel * age) <= RAIN_CLOUD) continue;
+        a = fade;
+      }
+    }
+  }
+  return a;
+}
 
 // Noise stretched along the crests (direction wd), breaking them into dashes.
 float rippleDash(vec2 world, vec2 wd) {
@@ -2015,9 +2059,11 @@ void main() {
   if (sdf < 1.0) discard; // land, trunks and the shoreline itself
   float depth = texelFetch(u_background, ivec2(gl_FragCoord.xy), 0).a;
   float a = shallowRipples(world, depth);
-  if (a <= 0.0) discard;
-  a *= u_cloudsOn ? 1.0 - 0.75 * cloudCover(world) : 1.0;
-  o = vec4(GLINT * a, a);
+  // Rain falls only from the clouds (everywhere with clouds off).
+  float drops = u_rain > 0.0 ? rainRings(world / u_cell, u_time) : 0.0;
+  if (a <= 0.0 && drops <= 0.0) discard;
+  if (a > 0.0 && u_cloudsOn) a *= 1.0 - 0.75 * cloudCover(world);
+  o = vec4(GLINT * a + RAIN_RING * drops, min(1.0, a + drops));
 }
 `
 
@@ -2095,6 +2141,7 @@ export const midgeVS = insectVS
 layout(location = 1) in vec4 a_look; // seed, ripple age (s), egg maturity (0..1), selected (midges) / brood (rafts)`,
     `${MIDGE_FETCH}
 uniform highp sampler2D u_mAux1;
+uniform highp sampler2D u_mVert; // (z, vz, -, -): height above the water (px)
 uniform float u_time;     // sim time (s)
 uniform float u_bodyTime; // params.insectBodyTime
 const float RIPPLE_LIFE = ${RIPPLE_LIFE.toFixed(2)};
@@ -2107,7 +2154,9 @@ vec4 a_look; // seed, ripple age (mode 3), egg ripeness, selected`,
   ivec2 mc = midgeTexel(gl_VertexID);
   vec4 ms = texelFetch(u_mState, mc, 0);
   vec4 ma = texelFetch(u_mAux, mc, 0);
-  a_body = vec4(ms.xy, ma.w, gl_VertexID < u_mCount ? ma.y : 6.0);
+  a_body = vec4(ms.xy, texelFetch(u_mVert, mc, 0).x, gl_VertexID < u_mCount ? ma.y : 6.0);
+  // Resting on land (state 1 is drawn on the water, legs dimpling it): a body as if perched.
+  if (a_body.w == 1.0 && texture(u_elev, (ms.xy / u_elevCell + 0.5) / u_elevDims).r >= LAND) a_body.w = 2.0;
   a_look = vec4(texelFetch(u_mTraits, mc, 0).x, 0.0, ma.y == 5.0 ? ma.z : 0.0, gl_VertexID == u_mSelected ? 1.0 : 0.0); // an egg's ripeness in aux.z
   if (u_mode == 3) {
     // Ripples (drawn as state 7): a ring spreading where it laid an egg

@@ -31,18 +31,22 @@ import { HEADER, ID_BITS, MAX_CELLS } from '../simShaders.js'
  *
  * The debug variant runs one boid (u_debugId) and writes its forces two per
  * texel, then the seen counts (flock, then each item sense) four per texel,
- * then its state (debugLayout says where).
+ * then the species' `signals` (scalars: what it weighed) four per texel, then
+ * its state (debugLayout says where).
  */
 
 /** GLSL name of a gene accessor. */
 export const geneMacro = (key) => `G_${key.replace(/[A-Z]/g, (c) => `_${c}`).toUpperCase()}`
 
-/** Where the debug pass puts each value: forces (2 per texel), counts (4 per texel), state. */
+/** Where the debug pass puts each value: forces (2 per texel), counts (4 per texel), signals (4 per texel), state. */
 export function debugLayout(def) {
   const forceTexels = Math.ceil(def.forces.length / 2)
   const senses = ['flock', ...itemSenses(def).map((s) => s.key)]
   const countTexels = Math.ceil(senses.length / 4)
-  return { forceTexels, senses, countTexels, stateTexel: forceTexels + countTexels, width: forceTexels + countTexels + 1 }
+  const signals = (def.signals ?? []).map(([key]) => key)
+  const signalTexels = Math.ceil(signals.length / 4)
+  const stateTexel = forceTexels + countTexels + signalTexels
+  return { forceTexels, senses, countTexels, signals, signalTexels, stateTexel, width: stateTexel + 1 }
 }
 
 const itemSenses = (def) => def.senses.filter((s) => s.kind === 'items')
@@ -59,8 +63,10 @@ function geneInputs(def) {
   return `uniform sampler2D u_genes; // ${T} texel(s) per boid, side by side\n${macros}`
 }
 
-const aux1Input = (def) => ((def.auxTextures ?? 1) > 1 ? 'uniform sampler2D u_aux1;' : '')
-const aux1Read = (def) => ((def.auxTextures ?? 1) > 1 ? '\n  vec4 aux1 = texelFetch(u_aux1, own, 0);' : '')
+const aux1Input = (def) => ((def.auxTextures ?? 1) > 1 ? 'uniform sampler2D u_aux1;' : '') + (def.vertical ? '\nuniform sampler2D u_vert; // (z, vz, -, -): height (px, + up from the water surface) and its rate' : '')
+const aux1Read = (def) => ((def.auxTextures ?? 1) > 1 ? '\n  vec4 aux1 = texelFetch(u_aux1, own, 0);' : '') + (def.vertical ? '\n  vec4 vert = texelFetch(u_vert, own, 0);' : '')
+/** The update's outputs after state and aux: aux1, then vert (as BoidKernel's extras). */
+const extraOuts = (def) => [...((def.auxTextures ?? 1) > 1 ? ['aux1'] : []), ...(def.vertical ? ['vert'] : [])]
 
 function itemDecls(def) {
   return itemSenses(def)
@@ -175,8 +181,8 @@ ${def.glsl.visit}
     }
   }`
 
-/** Everything it senses now: the flock, then the items. */
-const senseNow = (def) => `${flockScan(def)}${itemSenses(def).length ? `\n${itemScan(def)}` : ''}`
+/** Everything it senses now: the flock, then the items, then the species' own (glsl.sense). */
+const senseNow = (def) => `${flockScan(def)}${itemSenses(def).length ? `\n${itemScan(def)}` : ''}${def.glsl.sense ? `\n${def.glsl.sense}` : ''}`
 
 /**
  * What a boid keeps between looks, in its own texels of a few RGBA32UI
@@ -322,6 +328,12 @@ function debugOut(def) {
     while (c.length < 4) c.push('0.0')
     lines.push(`  if (t == ${L.forceTexels + t}) o_state = vec4(${c.join(', ')});`)
   }
+  const sig = (def.signals ?? []).map(([, glsl]) => `float(${glsl})`)
+  for (let t = 0; t < L.signalTexels; t++) {
+    const c = sig.slice(t * 4, t * 4 + 4)
+    while (c.length < 4) c.push('0.0')
+    lines.push(`  if (t == ${L.forceTexels + L.countTexels + t}) o_state = vec4(${c.join(', ')});`)
+  }
   lines.push(`  if (t == ${L.stateTexel}) o_state = vec4(DEBUG_POS, DEBUG_VEL);`)
   return `  int t = int(gl_FragCoord.x);\n${lines.join('\n')}`
 }
@@ -345,14 +357,14 @@ ${lookInputs(lookLayout(def))}
 ${aux1Input(def)}
 layout(location = 0) out vec4 o_state;
 layout(location = 1) out vec4 o_aux;
-${(def.auxTextures ?? 1) > 1 ? 'layout(location = 2) out vec4 o_aux1;' : ''}
+${extraOuts(def).map((n, i) => `layout(location = ${i + 2}) out vec4 o_${n};`).join('\n')}
 ${g.decl}
 ${debug ? debugFind() : ''}
 
 void main() {
   ivec2 c = ${debug ? 'debugCell()' : 'ivec2(gl_FragCoord.xy)'};
   int self = indexOf(c);
-  if (self >= u_count) { o_state = vec4(0.0); o_aux = vec4(0.0);${(def.auxTextures ?? 1) > 1 ? ' o_aux1 = vec4(0.0);' : ''} return; }
+  if (self >= u_count) { o_state = vec4(0.0); o_aux = vec4(0.0);${extraOuts(def).map((n) => ` o_${n} = vec4(0.0);`).join('')} return; }
   ivec2 own = coordOf(int(texelFetch(u_sortedKeys, c, 0).x & ID_MASK)); // this boid's own texel
   vec4 s = texelFetch(u_sorted, c, 0);
   vec2 pos = s.xy * u_rescale;
