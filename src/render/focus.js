@@ -10,12 +10,16 @@ export const FORCES = [
   { key: 'cohesion', label: 'Cohesion', hex: '#4ade80' },
   { key: 'alignment', label: 'Alignment', hex: '#60a5fa' },
   { key: 'separation', label: 'Separation', hex: '#f87171' },
-  { key: 'flowers', label: 'Flowers (by colour)', hex: '#f0abfc' },
-  { key: 'scum', label: 'Scum', hex: '#a3e635' },
+  // The midges' direction inputs (species/midges.js MIDGE_INPUTS, by key): what each link to steering pushes.
+  { key: 'midges', label: 'Midges', hex: '#60a5fa' },
   { key: 'pads', label: 'Lily pads', hex: '#2dd4bf' },
-  { key: 'laying', label: 'Laying (to scum)', hex: '#fb923c' },
-  { key: 'rain', label: 'Rain', hex: '#93c5fd' },
-  { key: 'propulsion', label: 'Propulsion', hex: '#e879f9' },
+  { key: 'scum', label: 'Scum', hex: '#a3e635' },
+  { key: 'colour', label: 'Coloured things', hex: '#f0abfc' },
+  { key: 'threat', label: 'Threat', hex: '#c084fc' },
+  { key: 'self', label: 'Self: velocity', hex: '#e879f9' },
+  { key: 'noise', label: 'Noise', hex: '#78716c' },
+  { key: 'drag', label: 'Air drag', hex: '#cbd5e1' },
+  { key: 'descend', label: 'Coming down (eat / lay)', hex: '#fb923c' },
   { key: 'seek', label: 'Seek target', hex: '#4ade80' },
   { key: 'spacing', label: 'Spacing', hex: '#f87171' },
   { key: 'evict', label: 'Chased off', hex: '#c084fc' },
@@ -29,6 +33,7 @@ const rgb = (hex) => [1, 3, 5].map((k) => parseInt(hex.slice(k, k + 2), 16) / 25
 const COLOUR = Object.fromEntries(FORCES.map((f) => [f.key, rgb(f.hex)]))
 const ARROW_SCALE = 0.35
 const DRIFT_SCALE = 1.5
+const UNKNOWN = [0.6, 0.6, 0.6]
 const ARROW_MAX = 120
 /** Lines to what it sees, and rings round seen items (flowers: in their colour as drawn). */
 const SEEN = [0.85, 0.9, 0.9]
@@ -45,6 +50,7 @@ export const SEEN_STYLES = {
   midges: { ring: 0 },
   flowers: { ring: 4, colour: rgb('#f0abfc'), alpha: 0.95 },
   purple: { ring: 4, colour: rgb('#a78bfa'), alpha: 0.95 },
+  cattail: { ring: 4, colour: rgb('#a16207'), alpha: 0.95 },
   yellow: { ring: 4, colour: rgb('#facc15'), alpha: 0.95 },
   scum: { ring: 2, colour: rgb('#a3e635'), alpha: 0.7 },
   pads: { ring: 5, colour: rgb('#2dd4bf'), alpha: 0.85 },
@@ -96,13 +102,14 @@ export class Lines {
   arrow(x, y, key, fx, fy) {
     const m = Math.hypot(fx, fy)
     if (m < 1e-6) return
-    const len = Math.min(ARROW_MAX, m * (BY_KEY[key].unit ? DRIFT_SCALE : ARROW_SCALE))
+    // A force with no entry in FORCES still draws (grey), so a missing label never breaks the frame.
+    const len = Math.min(ARROW_MAX, m * (BY_KEY[key]?.unit ? DRIFT_SCALE : ARROW_SCALE))
     if (len < 1.5) return
     const ux = fx / m
     const uy = fy / m
     const tx = x + ux * len
     const ty = y + uy * len
-    const c = COLOUR[key]
+    const c = COLOUR[key] ?? UNKNOWN
     const a = key === 'total' ? 1 : 0.9
     this.line(x, y, tx, ty, c, a)
     const head = Math.min(5, len * 0.4)

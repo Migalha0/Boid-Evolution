@@ -24,7 +24,6 @@ export const MAX_KINDS = 8
  *   regional how strongly the regional colour (green / yellow-green / brown) applies
  */
 const KINDS_METERS = [
-  { name: 'rush', blades: 6, length: [0.12, 0.22], width: 0.025, spread: 2.2, regional: 0.75, base: [0.22, 0.33, 0.12], tip: [0.38, 0.45, 0.19] },
   { name: 'reed', blades: 6, length: [0.22, 0.4], width: 0.03, spread: 1.1, regional: 0.75, base: [0.17, 0.28, 0.1], tip: [0.32, 0.43, 0.16] },
   {
     name: 'cattail',
@@ -51,7 +50,6 @@ const KINDS_METERS = [
     tip: [0.31, 0.42, 0.18],
     head: { length: 0.07, width: 0.08, color: [0.88, 0.76, 0.22] },
   },
-  { name: 'shrub', blades: 8, length: [0.12, 0.22], width: 0.085, spread: Math.PI * 2, regional: 0.35, base: [0.12, 0.2, 0.08], tip: [0.21, 0.3, 0.11] },
   {
     // Pickerelweed: broad, heart-ish leaves and a lavender flower spike.
     name: 'pickerelweed',

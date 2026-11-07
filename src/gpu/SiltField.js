@@ -1,5 +1,5 @@
 import { LAND_LEVEL } from '../sim/PondMap.js'
-import { createFramebuffer, createProgram, createTexture } from './gl.js'
+import { clearFramebuffers, createFramebuffer, createProgram, createTexture, FADED } from './gl.js'
 import { passVS } from './simShaders.js'
 
 /** World px per texel. */
@@ -113,6 +113,8 @@ export class SiltField {
     }
     this.dims = [w, h]
     this.cur = 0
+    this.zero = true
+    this.idle = 0
   }
 
   get texture() {
@@ -130,6 +132,20 @@ export class SiltField {
   update(sim, sway, mapTex, dt, params) {
     if (!this.textures.length) return
     const gl = this.gl
+    // Nothing stirring it (no fish): the silt only settles. Once settled to
+    // nothing it is cleared to 0 and left alone until a fish stirs it again.
+    if (!sim.count || !(params.siltAmount > 0)) {
+      if (this.zero) return
+      this.idle += dt
+      if (Math.exp(-this.idle / Math.max(0.1, params.siltSettle)) < FADED) {
+        clearFramebuffers(gl, this.fbos)
+        this.zero = true
+        return
+      }
+    } else {
+      this.idle = 0
+      this.zero = false
+    }
     const next = 1 - this.cur
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.fbos[next])
     gl.viewport(0, 0, this.dims[0], this.dims[1])

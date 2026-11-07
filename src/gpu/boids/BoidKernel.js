@@ -489,10 +489,18 @@ export class BoidKernel {
     }
     if (every > 1) {
       // Turns by bands of rows, one band a step (everyone when memories are new):
-      // whole blocks of the GPU's threads look or skip together.
+      // whole blocks of the GPU's threads look or skip together. When a frame
+      // runs at least `every` steps (ctx.stepsPerFrame, at high sim speed)
+      // everyone looks together every `every` steps instead: as often each,
+      // in a quarter (1 / every) of the passes. A look pass costs about the
+      // same however few look in it (the GPU waits on its reads), so fewer,
+      // fuller passes are much cheaper; taking turns keeps a slow frame from
+      // carrying everyone's look.
+      const together = (ctx.stepsPerFrame ?? 1) >= every
+      const all = this.lookAll || together
       const band = Math.ceil(activeRows / every)
-      const y0 = this.lookAll ? 0 : (this.frame % every) * band
-      const rows = this.lookAll ? activeRows : Math.min(band, activeRows - y0)
+      const y0 = all ? 0 : (this.frame % every) * band
+      const rows = together && !this.lookAll && this.frame % every !== 0 ? 0 : all ? activeRows : Math.min(band, activeRows - y0)
       if (rows > 0) {
         this.begin(this.lookProg, P.lookFbo, P.w, activeRows)
         gl.viewport(0, y0, P.w, rows)
@@ -532,6 +540,31 @@ export class BoidKernel {
     gl.bindFramebuffer(gl.FRAMEBUFFER, null)
     gl.bindVertexArray(null)
     gl.enable(gl.BLEND)
+  }
+
+  /**
+   * The selected boid's debug pass alone, nothing stepped (paused): its
+   * forces and signals as of now, read from the last step's sorted order,
+   * with no time passing (dt 0).
+   */
+  probe(ctx) {
+    const n = this.count
+    if (!n || !this.grid || this.debugId < 0 || this.debugId >= n) return false
+    this.params = ctx.params
+    const gl = this.gl
+    const P = this.particle
+    gl.disable(gl.BLEND)
+    gl.bindVertexArray(this.vao)
+    this.bindInputs(ctx)
+    P.look.forEach((t, k) => this.bindTex(this.units[`u_look${k}`], t))
+    this.begin(this.updateDebug, this.debugFbo, this.layout.width, 1)
+    this.updateUniforms(this.updateDebug.u, ctx, 0, n)
+    gl.uniform1i(this.updateDebug.u.u_debugId, this.debugId)
+    gl.drawArrays(gl.TRIANGLES, 0, 3)
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+    gl.bindVertexArray(null)
+    gl.enable(gl.BLEND)
+    return true
   }
 
   /** Between sorts: the state in the last sort's order again -> P.sorted. */

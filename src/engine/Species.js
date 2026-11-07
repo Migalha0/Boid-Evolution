@@ -55,11 +55,13 @@ export class Species {
     })
   }
 
+  /** Select boid i (-1: none). Switching to another keeps the last one's info showing until the new one's is read, so a panel never blinks. */
   select(i) {
     this.selected = i
+    this.focus.clear()
+    if (i >= 0) return
     this.selectedInfo = null
     this.senses = null
-    this.focus.clear()
   }
 
   /** The selected one's forces from the debug pass, after a frame that stepped. */
@@ -126,12 +128,17 @@ export class Species {
       const NG = this.def.genes.length
       const pool = new Float32Array(n * NG)
       const slots = []
+      let genSum = 0
+      let genMax = 0
       for (let i = 0; i < n; i++) {
         if (!this.alive(got.aux, i * 4)) continue
         slots.push(i)
+        const gen = this.def.lays ? Math.floor(got.aux[i * 4 + 3]) : 0 // a laying species keeps its generation in aux.w (its whole part: midges keep latch bits in the fraction)
+        genSum += gen
+        genMax = Math.max(genMax, gen)
         for (let g = 0; g < NG; g++) pool[i * NG + g] = got.genes[i * T * 4 + g]
       }
-      const population = NG && slots.length ? { count: slots.length, generation: 0, maxGeneration: 0, ...summarize(this.def.genes, pool, slots) } : null
+      const population = NG && slots.length ? { count: slots.length, generation: genSum / slots.length, maxGeneration: genMax, ...summarize(this.def.genes, pool, slots) } : null
       callback({ alive: slots.length, population, state: got.state, aux: got.aux })
     }
     this.readback.read(k.currentFbo, gl.COLOR_ATTACHMENT0, 0, 0, k.texW, rows, (v) => ((got.state = v), done()))

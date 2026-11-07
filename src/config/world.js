@@ -1,3 +1,4 @@
+import { GROWTH_DEFAULT } from '../sim/PondMap.js'
 import { PLANT_KINDS, plantAmountKey } from '../sim/Vegetation.js'
 
 /**
@@ -13,9 +14,15 @@ const between = (a, b, digits = 2) => {
   return Math.round((a + Math.random() * (b - a)) * k) / k
 }
 
-/** The water's murk: from clearer to murkier. */
+/**
+ * The water's murk, from clearer to murkier: a curve from how murky just
+ * under the surface to on the deepest floor, rising sooner or later between.
+ */
 export function randomMurk() {
-  return { murkSurface: between(0.05, 0.35), murkDeep: between(0.65, 0.97), logMurk: between(1.5, 4, 1) }
+  const top = between(0.05, 0.35)
+  const bottom = between(0.65, 0.97)
+  const bend = between(1, 2.2) // above 1 it murks over sooner with depth
+  return { murkCurve: [0, 0.25, 0.5, 0.75, 1].map((x) => [x, Math.round((1 - (1 - top - (bottom - top) * x) ** bend) * 100) / 100]) }
 }
 
 export function randomWorld() {
@@ -23,8 +30,8 @@ export function randomWorld() {
     // The pond: depth, plant mix and spread, trunks, floor, scum and pads.
     waterDepth: between(0.55, 1.2),
     ...Object.fromEntries(PLANT_KINDS.map((k) => [plantAmountKey(k.name), between(0.3, 1.8)])),
-    plantShallowDensity: between(0.3, 0.8),
-    plantDeepSparseness: between(0.3, 0.9),
+    // The growth curve, each point moved up or down a little (the ends of the plant zone stay put).
+    plantGrowth: GROWTH_DEFAULT.map(([x, y]) => [x, y > 0 ? Math.max(0.05, between(y * 0.6, Math.min(1.3, y * 1.3))) : y]),
     logCount: Math.floor(Math.random() * 9),
     sludgeAmount: between(0.2, 0.8),
     floorLitter: between(0.1, 0.8),

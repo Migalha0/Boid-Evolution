@@ -38,6 +38,8 @@ const BoidCanvas = forwardRef(function BoidCanvas({ params, onStats, onSelect },
     applyMidgeProfile: (profile) => engineRef.current?.applyMidgeProfile(profile),
     midgePopulation: () => engineRef.current?.midgePopulation() ?? null,
     clearMidges: () => engineRef.current?.clearMidges(),
+    deselect: () => engineRef.current?.deselect(),
+    setInspectorRect: (rect) => engineRef.current?.setInspectorRect(rect),
   }))
 
   useEffect(() => {

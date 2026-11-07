@@ -13,7 +13,7 @@ const MAX_SCUM_SPOTS = 4000
 /** Floats per lily pad in `pads.data` (x, y, radius first). */
 const PAD_STRIDE = 8
 /** Item sources (ItemSources order): what a sense's `source` index means. */
-export const SOURCE = { purple: 0, yellow: 1, scum: 2, pads: 3 }
+export const SOURCE = { purple: 0, yellow: 1, scum: 2, pads: 3, cattail: 4 }
 
 // Flowers: nectar per plant slot, (nectar 0..1, state, regrown, quota):
 // state 0 open, 1 closed (drunk dry, refilling), > 1 resting (state - 1 s
@@ -159,6 +159,7 @@ export class PondGpu {
     const { slot } = plantSlots(veg)
     const purple = []
     const yellow = []
+    const cattail = []
     const sw = Math.max(1, Math.ceil(W / SHELTER_CELL))
     const sh = Math.max(1, Math.ceil(H / SHELTER_CELL))
     const cover = new Float32Array(sw * sh)
@@ -168,8 +169,8 @@ export class PondGpu {
       const y = veg.data[o + 1]
       cover[Math.min(sh - 1, Math.max(0, Math.floor(y / SHELTER_CELL))) * sw + Math.min(sw - 1, Math.max(0, Math.floor(x / SHELTER_CELL)))]++
       const kind = veg.data[o + 4]
-      if (kind !== PLANT.PICKERELWEED && kind !== PLANT.IRIS) continue
-      // The flower sits at the tip of the central blade.
+      if (kind !== PLANT.PICKERELWEED && kind !== PLANT.IRIS && kind !== PLANT.CATTAIL) continue
+      // The head (flower, cattail spike) sits at the tip of the central blade.
       const reach = PLANT_KINDS[kind].length[1] * veg.data[o + 2] * 0.8
       const rot = veg.data[o + 3]
       const fx = x + Math.cos(rot) * reach
@@ -177,13 +178,13 @@ export class PondGpu {
       // Off screen (a blade leaning out of view, or a window made smaller
       // than the world): no food out there to keep midges out of view.
       if (map.insideView(fx, fy) < 0) continue
-      ;(kind === PLANT.PICKERELWEED ? purple : yellow).push(fx, fy, slot[i])
+      ;(kind === PLANT.PICKERELWEED ? purple : kind === PLANT.IRIS ? yellow : cattail).push(fx, fy, slot[i])
     }
     const scum = new Float32Array((this.scumPoints.length / 2) * 3)
     for (let i = 0; i < this.scumPoints.length / 2; i++) scum.set([this.scumPoints[i * 2], this.scumPoints[i * 2 + 1], i], i * 3)
     const padPts = new Float32Array(pads.count * 3)
     for (let i = 0; i < pads.count; i++) padPts.set([pads.data[i * PAD_STRIDE], pads.data[i * PAD_STRIDE + 1], i], i * 3)
-    this.items.set([Float32Array.from(purple), Float32Array.from(yellow), scum, padPts], W, H)
+    this.items.set([Float32Array.from(purple), Float32Array.from(yellow), scum, padPts, Float32Array.from(cattail)], W, H)
 
     // Nectar: full for every flower, kept as it is while the plants are the same.
     if (plantsChanged) {
@@ -278,9 +279,10 @@ export class PondGpu {
 
   /**
    * Sips of the boids of `kernel` perched on flowers (its definition's `eats`:
-   * mode and id channels, the eating mode, energy per s), added up by blending.
+   * mode and id channels, the eating mode, energy per s from the params),
+   * added up by blending.
    */
-  drink(kernel, dt) {
+  drink(kernel, dt, params) {
     const N = this.nectar
     const eats = kernel.def.eats
     if (!N || !eats || !kernel.count) return
@@ -301,7 +303,7 @@ export class PondGpu {
     gl.uniform1i(u.u_idChannel, eats.idChannel)
     gl.uniform1f(u.u_eatMode, eats.mode)
     gl.uniform2i(u.u_target, NECTAR_W, N.rows)
-    gl.uniform1f(u.u_sip, eats.rate * dt)
+    gl.uniform1f(u.u_sip, eats.rate(params) * dt)
     gl.drawArrays(gl.POINTS, 0, kernel.count)
     gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA)
     gl.bindFramebuffer(gl.FRAMEBUFFER, null)

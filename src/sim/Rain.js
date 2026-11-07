@@ -115,8 +115,10 @@ float rainUnit(uint h) { return float(h >> 8u) / 16777216.0; }
 ivec2 rainCellOf(vec2 q, int layer) { return ivec2(floor(q / RAIN_CELL + float(layer) * RAIN_SHIFT)); }
 // The drop of cell c (layer 0 or 1) at time t (s), in rain of this level:
 // false if it has none this period, else where it lands (scene px), how long
-// ago (s; its ring spreads from then) and its largest ring (scene px).
-bool rainDrop(ivec2 c, int layer, float t, float level, out vec2 at, out float age, out float R) {
+// ago (s; its ring spreads from then) and its largest ring (scene px). Also
+// false if it landed maxAge s ago or more (the caller has no use for it):
+// checked first, so most cells cost one hash.
+bool rainDrop(ivec2 c, int layer, float t, float level, float maxAge, out vec2 at, out float age, out float R) {
   uint h0 = rainPcg(uint(c.x) * 1597334677u ^ rainPcg(uint(c.y) * 3812015801u ^ uint(layer)));
   float h = rainUnit(h0);
   // Long enough for the largest ring, plus an idle gap.
@@ -124,6 +126,7 @@ bool rainDrop(ivec2 c, int layer, float t, float level, out vec2 at, out float a
   float tt = t + h * 97.0;
   float k = floor(tt / period);
   age = tt - k * period;
+  if (age >= maxAge) return false;
   uint hk = rainPcg(h0 ^ uint(int(k)) * 2654435761u);
   if (rainUnit(hk) >= level) return false;
   float size = rainUnit(rainPcg(hk + 1u));

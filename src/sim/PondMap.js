@@ -1,4 +1,5 @@
 import { generateLogs } from './Logs.js'
+import { evalCurve } from './curve.js'
 import { PLANT, PLANT_KINDS, Vegetation } from './Vegetation.js'
 
 /** World px per elevation sample. */
@@ -13,10 +14,37 @@ export const TINT_CELL = 8
 const VEG_START = 0.5
 /**
  * Even where the shallows are planted, plants in the water stand this far
- * apart (as a share of the land's cover), so water shows between them; only
- * a narrow fringe along the bank grows thick, so the bank's edge never shows.
+ * apart (as a share of the land's cover), so water shows between them,
+ * closing up gradually towards the bank.
  */
 const WATER_COVER = 0.45
+/**
+ * Most of the water that may be plant habitat (shallow enough): past this
+ * share (low water, a shallow map) the water plants thin out evenly, so about
+ * as much water stays open as on a deeper pond.
+ */
+const ZONE_MAX = 0.45
+/** Plant habitat: water at least this shallow (PondMap.shallowness). */
+const ZONE_SHALLOW = 0.35
+/**
+ * Where a spot lies for the growth curve (habitatAt): 0 well inland (LAND_SPAN
+ * px or more from the water) .. SHORE_X at the shoreline .. 1 in water too
+ * deep for plants (shallowness 0).
+ */
+export const SHORE_X = 0.3
+const LAND_SPAN = 150
+/** How much grows along the habitat (PondMap.growth): [x, growth] points; 1 = fully planted, above 1 denser still. */
+export const GROWTH_DEFAULT = [
+  [0, 0.8],
+  [0.2, 0.9],
+  [SHORE_X, 1],
+  [0.45, 0.8],
+  [0.65, 0.45],
+  [0.8, 0.15],
+  [1, 0],
+]
+/** In bare holes and clearings, a few tufts still grow (share of the plants there would be). */
+const TUFTS = 0.06
 /** Reed beds are judged on a grid of cells this size (px). */
 const REED_CELL = 8
 
@@ -34,9 +62,11 @@ const REED_CELL = 8
  *    banks out into the water.
  *  - surfaceSdf: like sdf, but for things floating on the surface: the parts of
  *    the trunks that break the surface count as land.
- *  - vegetation: plants growing out from the land and shallows; the shallower
- *    and closer to shore, the denser. Land is heavily overgrown. Plants next to
- *    a trunk grow away from it (on land only partly, see landClearing).
+ *  - vegetation: plants on land and in the shallows, as much as the growth
+ *    curve says for where a spot lies (habitatAt: inland, the shore, the
+ *    shallows, the deep). Below full growth the plants thin out, and where
+ *    growth is low the ground opens in irregular holes and clearings. Plants next to a trunk grow away from it (on land
+ *    only partly, see landClearing).
  */
 export class PondMap {
   constructor() {
@@ -47,10 +77,8 @@ export class PondMap {
     /** Visible part of the map [x, y, w, h]; spawning prefers it. */
     this.view = null
     this.version = 0
-    /** 0..1, how much the deep edge of the plant zone is thinned. */
-    this.sparseness = 0.6
-    /** 0..1, share of the shallowest water and shore fringe that is planted; the rest opens up in gaps. */
-    this.shallowDensity = 0.5
+    /** How much grows where: the growth curve (GROWTH_DEFAULT). */
+    this.growth = GROWTH_DEFAULT
     /** Number of fallen trunks. */
     this.logCount = 4
     this.logs = []
@@ -106,7 +134,7 @@ export class PondMap {
     if (this.width) this.generate()
   }
 
-  /** Regrow the plants alone (same floor and shore), e.g. after a sparseness change. */
+  /** Regrow the plants alone (same floor and shore), e.g. after the growth curve changes. */
   regrowPlants() {
     if (this.width) this.generateVegetation()
   }
@@ -262,18 +290,35 @@ export class PondMap {
     }
     this.tint = { cols: tc, rows: tr, data: tint }
     const claimAt = this.makeClaims(rand, noise)
-    // Open water in the shallows: irregular gaps where a noise field is below
-    // the level that leaves shallowDensity of the area planted (the noise is
-    // about normal, mean 0.525, sd 0.12; logistic approximation of its quantile).
-    const planted = Math.min(Math.max(this.shallowDensity, 1e-3), 1 - 1e-3)
-    const gapLevel = 0.525 + (0.12 * Math.log((1 - planted) / planted)) / 1.7
-    // Gaps keep off the shore itself: a fringe stays planted so the bank's
-    // edge never shows.
-    const unGapped = (x, y, d) => {
-      if (this.shallowDensity >= 1) return 1
-      const fringe = 1 - smoothstep(12, 40, d)
-      return Math.max(fringe, smoothstep(gapLevel - 0.03, gapLevel + 0.03, fbm(noise, x * 0.009 + 311.7, y * 0.009 + 87.3)))
+    // Holes and clearings: where a noise field (broad shapes broken up by
+    // finer ones, so a big clearing is ragged and dotted with plants rather
+    // than bare through the middle) is below the level that leaves `share`
+    // of the ground planted. Levels are this map's own quantiles of it.
+    const holeNoise = (x, y) => 0.45 * fbm(noise, x * 0.004 + 517.3, y * 0.004 + 211.9) + 0.55 * fbm(noise, x * 0.016 + 311.7, y * 0.016 + 87.3)
+    const sorted = []
+    for (let k = 0; k < 4096; k++) sorted.push(holeNoise(((k * 0.618034) % 1) * this.width, (k / 4096) * this.height))
+    sorted.sort((a, b) => a - b)
+    const holeLevel = (share) => sorted[Math.min(4095, Math.max(0, Math.floor((1 - share) * 4095)))]
+    // Planted here (0..1), for a share planted; holes thin out over their
+    // edges rather than stopping at a line.
+    const unHoled = (x, y, share) => {
+      if (share >= 1) return 1
+      if (share <= 0) return TUFTS
+      const level = holeLevel(share)
+      return Math.max(TUFTS, smoothstep(level - 0.05, level + 0.05, holeNoise(x, y)))
     }
+    // The growth curve at a spot, everywhere (right up to the shore on either
+    // side): how much of the ground is planted (holes and clearings take the
+    // rest) and how densely, together making the growth. Mostly it thins;
+    // holes open up in earnest only where growth is low (above 1: none, denser).
+    const growthAt = (d, shallow) => {
+      const g = Math.max(0, evalCurve(this.growth, this.habitatAt(d, shallow)))
+      const share = Math.min(1, Math.cbrt(g))
+      return { share, dense: g <= 1 ? (share > 0 ? g / share : 0) : g }
+    }
+    // Mostly shallow water: the water plants thin out to keep some open.
+    const zone = this.plantZoneShare()
+    const open = zone > ZONE_MAX ? ZONE_MAX / zone : 1
     // Trunks lie where they fell. In the water nothing grows under one, and
     // plants beside it are bent away from it (and kept short enough), so the
     // trunk shows. On land (drawn over the plants anyway) they only make way
@@ -282,10 +327,10 @@ export class PondMap {
     // Ground a plant of each kind covers seen from above (its blades and head).
     const COVER = PLANT_KINDS.map((k) => k.blades * ((k.length[0] + k.length[1]) / 2) * k.width + (k.head ? k.head.length * k.head.width : 0))
     // What grows where: [kind, share] per habitat, picked in this order.
-    const LAND = [[PLANT.SHRUB, 0.4], [PLANT.REED, 0.25], [PLANT.CATTAIL, 0.2], [PLANT.IRIS, 0.05], [PLANT.RUSH, 0.1]]
-    const SHALLOW = [[PLANT.CATTAIL, 0.33], [PLANT.REED, 0.37], [PLANT.IRIS, 0.11], [PLANT.PICKERELWEED, 0.09], [PLANT.RUSH, 0.1]]
+    const LAND = [[PLANT.REED, 0.62], [PLANT.CATTAIL, 0.3], [PLANT.IRIS, 0.08]]
+    const SHALLOW = [[PLANT.CATTAIL, 0.33], [PLANT.REED, 0.47], [PLANT.IRIS, 0.11], [PLANT.PICKERELWEED, 0.09]]
     // Pickerelweed favours the middle shallows.
-    const MIDDLE = [[PLANT.REED, 0.42], [PLANT.RUSH, 0.32], [PLANT.PICKERELWEED, 0.16], [PLANT.CATTAIL, 0.06], [PLANT.IRIS, 0.04]]
+    const MIDDLE = [[PLANT.REED, 0.74], [PLANT.PICKERELWEED, 0.16], [PLANT.CATTAIL, 0.06], [PLANT.IRIS, 0.04]]
     const pick = (mix, r) => {
       for (const [kind, share] of mix) if ((r -= share) < 0) return kind
       return mix[mix.length - 1][0]
@@ -302,7 +347,7 @@ export class PondMap {
     }
     // Each kind grows as often as its amount says: below 1 the rest of its
     // plants are swapped for others from `mix` (as many as cover the same
-    // ground: a cattail's place takes about three rushes), above 1 a fraction
+    // ground: a cattail's place takes about two reeds), above 1 a fraction
     // is a chance of one more; at whole amounts the layout doesn't change.
     const add = (kind, x, y, scale, rot, seed, br, ye, land, mix) => {
       const amount = this.kindAmounts[kind] ?? 1
@@ -364,27 +409,30 @@ export class PondMap {
         const d = this.distanceAt(x, y)
         const patch = 0.55 + 0.6 * fbm(noise, x * 0.02, y * 0.02) // clumpy, never uniform
         if (d < 0) {
-          // Land: heavily overgrown.
-          if (rand() > 0.9 * patch) continue
+          // Land: as the curve says, low and close.
+          const g = growthAt(d, 0)
+          if (rand() > 0.9 * patch * g.dense * unHoled(x, y, g.share)) continue
           const r = rand()
           const kind = claimAt(x, y) ?? pick(LAND, r)
-          add(kind, x, y, 1 + rand() * 0.35, rotation(x, y), rand(), brown(x, y), yellow(x, y), true, LAND)
+          add(kind, x, y, 0.75 + rand() * 0.3, rotation(x, y), rand(), brown(x, y), yellow(x, y), true, LAND)
           continue
         }
         const shallow = this.shallowness(x, y, d)
-        // Towards the deep edge of the plant zone growth thins out, so open
-        // water reads as water; the shallowest water and shore fringes, lush
-        // otherwise, open up in gaps.
+        // As the curve says; in the lush shallows the plants stand apart so
+        // water shows between them, closer together towards the bank (over
+        // 30 px, so the shore has no band of its own).
+        const g = growthAt(d, shallow)
         const lush = smoothstep(0.45, 0.9, shallow)
-        const thin = (1 - this.sparseness * (1 - lush)) * (1 - lush + lush * unGapped(x, y, d))
-        const fringe = 1 - smoothstep(4, 16, d)
-        const cover = 1 - lush * (1 - fringe) * (1 - WATER_COVER)
-        if (rand() > Math.min(1, shallow ** 1.4 * 1.2 * patch) * thin * cover) continue
+        const bank = 1 - smoothstep(0, 30, d)
+        const cover = 1 - lush * (1 - bank) * (1 - WATER_COVER)
+        const opened = bank + (1 - bank) * open
+        if (rand() > Math.min(1, 1.2 * patch) * g.dense * unHoled(x, y, g.share) * cover * opened) continue
         const r = rand()
-        // The deep edge grows only rush, but takes from the middle mix in its place.
+        // The deep edge grows only short reeds, but takes from the middle mix in their place.
         const mix = shallow > 0.7 ? SHALLOW : MIDDLE
-        const kind = claimAt(x, y) ?? (shallow > 0.35 ? pick(mix, r) : PLANT.RUSH)
-        add(kind, x, y, 0.75 + shallow * 0.4 + rand() * 0.2, rotation(x, y), rand(), brown(x, y), yellow(x, y), false, mix)
+        const edge = shallow <= ZONE_SHALLOW
+        const kind = claimAt(x, y) ?? (edge ? PLANT.REED : pick(mix, r))
+        add(kind, x, y, (0.75 + shallow * 0.4 + rand() * 0.2) * (edge ? 0.6 : 1), rotation(x, y), rand(), brown(x, y), yellow(x, y), false, mix)
       }
     }
 
@@ -428,6 +476,26 @@ export class PondMap {
       }
       return rand() < best * 0.95 ? kind : null
     }
+  }
+
+  /** Where a spot lies for the growth curve (SHORE_X): by its distance inland on land (d < 0), by its shallowness in water. */
+  habitatAt(d, shallow) {
+    return d < 0 ? SHORE_X * (1 - Math.min(1, -d / LAND_SPAN)) : SHORE_X + (1 - SHORE_X) * (1 - shallow)
+  }
+
+  /** Share of the water that is plant habitat (shallow enough), sampled every 8 px. */
+  plantZoneShare() {
+    let water = 0
+    let zone = 0
+    for (let y = 4; y < this.height; y += 8) {
+      for (let x = 4; x < this.width; x += 8) {
+        const d = this.distanceAt(x, y)
+        if (d < 0) continue
+        water++
+        if (this.shallowness(x, y, d) > ZONE_SHALLOW) zone++
+      }
+    }
+    return water ? zone / water : 0
   }
 
   /** Whether (x, y) is in a reed bed: its grid cell's centre is water this vegetated. */

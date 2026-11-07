@@ -18,7 +18,7 @@ const SPECIES = {
     genes: GENES,
     storageKey: 'midgeProfiles',
     tab: 'Midges',
-    world: ['insectHunger', 'insectWind', 'flowerNectar', 'flowerRegrow', 'flowerRefills', 'flowerDormancy'],
+    world: ['midgeEnergyMax', 'midgeFeedRate', 'midgeBaseBurn', 'insectHunger', 'insectWind', 'flowerNectar', 'flowerRegrow', 'flowerRefills', 'flowerDormancy', 'eggCost'],
   },
 }
 
@@ -80,6 +80,8 @@ export function parseProfile(species, json) {
     const [r, g, b] = PLANT_KINDS[likes === purple ? PLANT.PICKERELWEED : PLANT.IRIS].head.color
     p.genes = { ...p.genes, flowers: likes, flowerR: r, flowerG: g, flowerB: b, colourTolerance: 0.5 }
   }
+  // Files from before the height gene counted in tens of px (HEIGHT_UNIT).
+  if (Number(p.genes.height) > 3.5) p.genes = { ...p.genes, height: Number(p.genes.height) / 10 }
   // Files from before `source` were all population averages.
   const source = p.source === 'individual' ? 'individual' : 'average'
   return { ...p, format: sp.format, species, source, name: String(p.name ?? 'imported'), genes: genomeToObject(sp.genes, objectToGenome(sp.genes, p.genes)) }
@@ -99,6 +101,18 @@ export function loadLibrary(species) {
   } catch {
     return []
   }
+}
+
+/** Add a profile to the stored library of `species` (same name replaces). */
+export function addToLibrary(species, profile) {
+  saveLibrary(species, [profile, ...loadLibrary(species).filter((p) => p.name !== profile.name)])
+}
+
+/** The library's training profile (`trained`) of the latest generation, or null. */
+export function bestTrained(species) {
+  return loadLibrary(species)
+    .filter((p) => p.trained)
+    .reduce((best, p) => (!best || p.generation > best.generation ? p : best), null)
 }
 
 export function saveLibrary(species, list) {

@@ -1,6 +1,7 @@
 import { useCallback, useMemo, useRef, useState } from 'react'
 import BoidCanvas from './components/BoidCanvas.jsx'
 import ControlPanel from './components/ControlPanel.jsx'
+import Inspector from './components/Inspector.jsx'
 import PopulationDrawer from './components/PopulationDrawer.jsx'
 import { DEFAULT_PARAMS } from './config/defaults.js'
 import { randomMurk, randomWorld } from './config/world.js'
@@ -22,10 +23,13 @@ export default function App() {
     [],
   )
 
+  const onInspectorRect = useCallback((r) => canvasRef.current?.setInspectorRect(r), [])
+
   return (
     <main className="relative h-full w-full overflow-hidden bg-slate-950">
       <BoidCanvas ref={canvasRef} params={params} onStats={setStats} />
       <PopulationDrawer history={stats.history} />
+      <Inspector fish={stats.selected?.speed != null ? stats.selected : null} midge={stats.midges?.selected} linkCost={params.linkCost} linkGrowth={params.linkGrowth} params={params} onRect={onInspectorRect} onClose={() => canvasRef.current?.deselect()} />
       <ControlPanel
         params={params}
         setParam={setParam}

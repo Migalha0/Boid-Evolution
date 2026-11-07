@@ -147,6 +147,19 @@ export class Readback {
   }
 }
 
+/** Clear each framebuffer to 0 (a field's ping-pong pair, back to nothing). */
+export function clearFramebuffers(gl, fbos) {
+  gl.clearColor(0, 0, 0, 0)
+  for (const fbo of fbos) {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo)
+    gl.clear(gl.COLOR_BUFFER_BIT)
+  }
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+}
+
+/** Below this share of what was there, a fading field counts as gone (its 16-bit texels near 0 anyway): it is cleared and stops stepping. */
+export const FADED = 1e-4
+
 /** GPU time of a section via EXT_disjoint_timer_query_webgl2; `ms` stays null when unsupported. */
 export class GpuTimer {
   constructor(gl) {

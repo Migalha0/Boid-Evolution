@@ -51,6 +51,36 @@ export function Slider({ label, value, min, max, step = 1, onChange, unit = '' }
 }
 
 /**
+ * A range on one track, [low, high]: two handles that cannot cross (the
+ * low one stays at or below the high one).
+ */
+export function RangeSlider({ label, value: [lo, hi], min, max, step = 1, onChange, unit = '' }) {
+  const decimals = step < 1 ? (String(step).split('.')[1]?.length ?? 0) : 0
+  const pct = (v) => `${((v - min) / (max - min)) * 100}%`
+  const thumb =
+    'pointer-events-none absolute inset-0 h-1.5 w-full appearance-none bg-transparent ' +
+    '[&::-webkit-slider-thumb]:pointer-events-auto [&::-webkit-slider-thumb]:h-3.5 [&::-webkit-slider-thumb]:w-3.5 [&::-webkit-slider-thumb]:cursor-pointer [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:border-2 [&::-webkit-slider-thumb]:border-slate-900 [&::-webkit-slider-thumb]:bg-sky-400 ' +
+    '[&::-moz-range-thumb]:pointer-events-auto [&::-moz-range-thumb]:h-3 [&::-moz-range-thumb]:w-3 [&::-moz-range-thumb]:cursor-pointer [&::-moz-range-thumb]:rounded-full [&::-moz-range-thumb]:border-2 [&::-moz-range-thumb]:border-slate-900 [&::-moz-range-thumb]:bg-sky-400'
+  return (
+    <div>
+      <div className="mb-1 flex justify-between text-xs">
+        <span className="text-slate-300">{label}</span>
+        <span className="font-mono tabular-nums text-slate-400">
+          {lo.toFixed(decimals)} – {hi.toFixed(decimals)}
+          {unit}
+        </span>
+      </div>
+      <div className="relative h-1.5">
+        <div className="absolute inset-0 rounded-full bg-slate-700" />
+        <div className="absolute inset-y-0 rounded-full bg-sky-400" style={{ left: pct(lo), right: `calc(100% - ${pct(hi)})` }} />
+        <input type="range" aria-label={`${label}: low`} min={min} max={max} step={step} value={lo} onChange={(e) => onChange([Math.min(Number(e.target.value), hi), hi])} className={thumb} />
+        <input type="range" aria-label={`${label}: high`} min={min} max={max} step={step} value={hi} onChange={(e) => onChange([lo, Math.max(Number(e.target.value), lo)])} className={thumb} />
+      </div>
+    </div>
+  )
+}
+
+/**
  * Slider on a log scale, for ranges spanning several orders of magnitude.
  * With `zero`, the far left end is 0 (and `min` starts just after it); with
  * `unlimited`, the far right end is Infinity (shown as ∞, `max` just before it).
@@ -109,7 +139,7 @@ export function Toggle({ label, checked, onChange, swatch }) {
 /** One of a few options, as a row of buttons. */
 export function Segmented({ value, options, onChange }) {
   return (
-    <div className="grid grid-cols-3 gap-1 rounded-md bg-slate-800/80 p-0.5">
+    <div className="grid gap-1 rounded-md bg-slate-800/80 p-0.5" style={{ gridTemplateColumns: `repeat(${options.length}, minmax(0, 1fr))` }}>
       {options.map((o) => (
         <button
           key={o.value}
@@ -144,13 +174,27 @@ export function RangeModes({ label = 'Vision range', value, onChange }) {
   )
 }
 
-/** A species' tick rate: steps between looks around (the same control on each species' tab). */
-export function TickRate({ value, onChange, children }) {
+/** A grid of labelled numbers: [label, value, tone?] (tone: a text colour class). */
+export function StatGrid({ items }) {
   return (
-    <Section title="Tick rate">
+    <dl className="grid grid-cols-3 gap-1">
+      {items.map(([label, value, tone]) => (
+        <div key={label} className="rounded-md bg-slate-800/60 px-2 py-1">
+          <dt className="truncate text-[10px] text-slate-500">{label}</dt>
+          <dd className={`font-mono text-xs tabular-nums ${tone ?? 'text-slate-200'}`}>{value}</dd>
+        </div>
+      ))}
+    </dl>
+  )
+}
+
+/** A species' tick rate: steps between looks around (the same control on each species' tab). */
+export function TickRate({ value, onChange, children, fold = false }) {
+  return (
+    <Section title="Tick rate (performance)" fold={fold}>
       <Slider label="Looks around every" value={value} min={1} max={12} onChange={onChange} unit={value === 1 ? ' step' : ' steps'} />
       <Hint>
-        {children} They take turns, so each step only a share of them looks; the rest steer by what they saw last. Slower ticks cost less and react later.
+        {children} They take turns, so each step only a share of them looks; the rest steer by what they saw last. At sim speeds of {value}× and up they all look on the same step instead (each still every {value} steps), which costs far less. Slower ticks cost less and react later.
       </Hint>
     </Section>
   )

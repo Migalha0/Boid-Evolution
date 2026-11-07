@@ -1,4 +1,4 @@
-import { createFramebuffer, createProgram, createTexture } from './gl.js'
+import { clearFramebuffers, createFramebuffer, createProgram, createTexture, FADED } from './gl.js'
 import { passVS } from './simShaders.js'
 
 /** World px per texel. */
@@ -72,6 +72,9 @@ export class SwayField {
     this.fbos = []
     this.dims = [0, 0]
     this.cur = 0
+    // Exactly 0 everywhere (new textures are zeroed): with no fish to push it, nothing to step.
+    this.zero = true
+    this.idle = 0
   }
 
   resize(width, height) {
@@ -89,6 +92,8 @@ export class SwayField {
     }
     this.dims = [w, h]
     this.cur = 0
+    this.zero = true
+    this.idle = 0
   }
 
   get texture() {
@@ -106,6 +111,20 @@ export class SwayField {
   update(sim, dt, params) {
     if (!this.textures.length) return
     const gl = this.gl
+    // No fish: the field only fades. Once faded to nothing it is cleared to 0
+    // and left alone (stepping zeros gives zeros) until a fish swims again.
+    if (!sim.count) {
+      if (this.zero) return
+      this.idle += dt
+      if (Math.exp(-params.wakeFade * this.idle) < FADED) {
+        clearFramebuffers(gl, this.fbos)
+        this.zero = true
+        return
+      }
+    } else {
+      this.idle = 0
+      this.zero = false
+    }
     const next = 1 - this.cur
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.fbos[next])
     gl.viewport(0, 0, this.dims[0], this.dims[1])

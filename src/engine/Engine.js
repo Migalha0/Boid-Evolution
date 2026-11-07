@@ -2,7 +2,8 @@ import { BoidKernel } from '../gpu/boids/BoidKernel.js'
 import { createFramebuffer, createTexture, GpuTimer, Readback } from '../gpu/gl.js'
 import { PondGpu, SOURCE } from '../gpu/PondGpu.js'
 import { SEEN_STYLES } from '../render/focus.js'
-import { mutate } from '../sim/genetics.js'
+import { genomeToObject, mutate, objectToGenome } from '../sim/genetics.js'
+import { addToLibrary, bestTrained, makeIndividualProfile } from '../sim/profiles.js'
 import { FISH } from '../species/fish.js'
 import { DEATH, MIDGE_GENES, MIDGES, MODE } from '../species/midges.js'
 import { MapTextures } from '../gpu/MapTextures.js'
@@ -44,8 +45,7 @@ export class Engine {
     this.params = { ...params }
     this.onStats = onStats
     this.map = new PondMap()
-    this.map.sparseness = this.params.plantDeepSparseness
-    this.map.shallowDensity = this.params.plantShallowDensity
+    this.map.growth = this.params.plantGrowth
     this.map.logCount = this.params.logCount
     this.map.landClearing = this.params.logLandClearing
     this.map.kindAmounts = PLANT_KINDS.map((k) => this.params[plantAmountKey(k.name)] ?? 1)
@@ -62,6 +62,8 @@ export class Engine {
     this.midgeStats = null
     this.midgeHistory = []
     this.midgeExtinctions = 0
+    this.trainSessions = 0
+    this.trainSaves = 0
     this.midgesPresent = false
     this.lockedProfile = null
     this.raf = 0
@@ -200,15 +202,13 @@ export class Engine {
     const { map, params: p } = this
     const amounts = PLANT_KINDS.map((k) => p[plantAmountKey(k.name)] ?? 1)
     const plants =
-      p.plantDeepSparseness !== map.sparseness ||
-      p.plantShallowDensity !== map.shallowDensity ||
+      p.plantGrowth !== map.growth ||
       p.logLandClearing !== map.landClearing ||
       amounts.some((a, k) => a !== map.kindAmounts[k])
     const logs = p.logCount !== map.logCount
     const depth = p.waterDepth !== map.waterDepth || p.landAmount !== map.landAmount
     if (!plants && !logs && !depth) return
-    map.sparseness = p.plantDeepSparseness
-    map.shallowDensity = p.plantShallowDensity
+    map.growth = p.plantGrowth
     map.landClearing = p.logLandClearing
     map.kindAmounts = amounts
     map.logCount = p.logCount
@@ -235,13 +235,13 @@ export class Engine {
     this.sim.reset(this.params)
   }
 
-  /** Start the midges over: a fresh flock of `insectStart`, random genomes or the profile's (mutated unless locked). */
-  restartMidges(profile = null) {
+  /** Start the midges over: a fresh flock of `count` (default `insectStart`), random genomes or the profile's (mutated unless locked). */
+  restartMidges(profile = null, count = this.params.insectStart) {
     const p = this.params
     const source = profile ?? (p.midgeLocked ? p.midgeProfile : null)
-    const base = source ? MIDGE_GENES.map((g) => source.genes[g.key] ?? (g.min + g.max) / 2) : null
-    const genome = base ? (p.midgeLocked ? base : () => mutate(MIDGE_GENES, base, p.mutationRate, p.mutationSize, p.mutationFlip)) : null
-    const n = Math.max(0, Math.round(p.insectStart))
+    const base = source ? objectToGenome(MIDGE_GENES, source.genes, p) : null
+    const genome = base ? (p.midgeLocked ? base : () => mutate(MIDGE_GENES, base, p)) : null
+    const n = Math.max(0, Math.round(count))
     this.pond.sync()
     this.midgeSim.setCount(n, p, genome)
     this.midgeSim.reset(p, genome)
@@ -250,6 +250,28 @@ export class Engine {
     this.midgeFlock = n
     this.midgesPresent = n > 0
     this.midgeStats = null
+  }
+
+  /**
+   * Training: every midge and egg gone ends a session. One midge of the
+   * latest generation laid in it (engine/Laying.js best) is saved as a
+   * training profile if that generation beats every training profile saved
+   * so far (so none from a session that bred none), then a new session
+   * starts: params.midgeTrainCount midges, random or from the best training profile
+   * (params.midgeTrainFrom).
+   */
+  nextTrainingSession() {
+    const p = this.params
+    const best = this.laying.best
+    const saved = bestTrained('midge')
+    if (best && best.generation > (saved?.generation ?? 0)) {
+      const genes = genomeToObject(MIDGE_GENES, best.genome)
+      const name = `trained · gen ${best.generation} · ${new Date().toLocaleString()}`
+      addToLibrary('midge', { ...makeIndividualProfile('midge', name, { id: '?', generation: best.generation, genes }, p, this.time), trained: true })
+      this.trainSaves++
+    }
+    if (this.midgeFlock > 0) this.trainSessions++ // not when training starts on an empty pond
+    this.restartMidges(p.midgeTrainFrom === 'best' ? bestTrained('midge') : null, p.midgeTrainCount)
   }
 
   /** Every midge gone (the user's doing: not counted as dying out). */
@@ -264,7 +286,7 @@ export class Engine {
 
   /** Every midge takes the profile's genome. */
   applyMidgeProfile(profile) {
-    const genome = MIDGE_GENES.map((g) => profile.genes[g.key] ?? (g.min + g.max) / 2)
+    const genome = objectToGenome(MIDGE_GENES, profile.genes, this.params)
     if (this.midgeSim.count) this.midgeSim.writeGenes(() => genome)
   }
 
@@ -303,6 +325,16 @@ export class Engine {
       this.fish.select(-1)
       callback?.(-1)
     })
+  }
+
+  /** Where the inspector panel is (a DOMRect in the page, or null): the selected one gets a line to it. */
+  setInspectorRect(rect) {
+    if (!rect) {
+      this.renderer.inspectorRect = null
+      return
+    }
+    const c = this.canvas.getBoundingClientRect()
+    this.renderer.inspectorRect = { left: rect.left - c.left, top: rect.top - c.top, right: rect.right - c.left, bottom: rect.bottom - c.top }
   }
 
   /** Nothing selected: no fish or midge (and any pick still in flight dropped). */
@@ -366,27 +398,29 @@ export class Engine {
       this.sim.debugId = this.fish.selected
       this.midgeSim.debugId = this.midges.selected
       if (steps && midges) this.keepMidgeTrail()
+      const context = () => ({
+        params: this.params,
+        mapTex: this.mapTex,
+        pond: this.pond,
+        laying: this.laying,
+        wind: this.wind,
+        rain: this.rain,
+        rainCell: this.renderer.cell ?? [1, 1], // the drops' grid, as the water draws them
+        clouds: this.renderer.cloudTex,
+        sway: this.sway,
+        time: this.time,
+        stepsPerFrame: steps, // the kernels batch their looks when a frame runs many steps
+      })
       for (let k = 0; k < steps; k++) {
         this.time += dt
         this.wind.update(dt, this.params)
         this.rain.update(dt, this.params)
-        const ctx = {
-          params: this.params,
-          mapTex: this.mapTex,
-          pond: this.pond,
-          laying: this.laying,
-          wind: this.wind,
-          rain: this.rain,
-          rainCell: this.renderer.cell ?? [1, 1], // the drops' grid, as the water draws them
-          clouds: this.renderer.cloudTex,
-          sway: this.sway,
-          time: this.time,
-        }
+        const ctx = context()
         this.sim.step(dt, ctx)
         if (midges) {
           this.pond.updateFlowers(dt, this.params, this.time)
           this.midgeSim.step(dt, ctx)
-          this.pond.drink(this.midgeSim, dt)
+          this.pond.drink(this.midgeSim, dt, this.params)
         }
         this.sway.update(this.sim, dt, this.params)
         this.scum.update(this.sway, this.mapTex, dt, this.params)
@@ -395,8 +429,11 @@ export class Engine {
       }
       if (steps) this.simTimer.end()
       if (steps && midges) this.laying.poll(this.params)
-      this.fish.readFocus(steps > 0)
-      this.midges.readFocus(steps > 0)
+      // Paused, the selected one's forces and wiring are still worked out (nothing moves).
+      const probedFish = !steps && this.sim.probe(context())
+      const probedMidge = !steps && midges && this.midgeSim.probe(context())
+      this.fish.readFocus(steps > 0 || probedFish)
+      this.midges.readFocus(steps > 0 || probedMidge)
       this.renderer.nectarTex = this.pond.nectarTexture
       this.renderer.flowerLookTex = this.pond.flowerLook
       this.renderTimer.begin()
@@ -408,7 +445,7 @@ export class Engine {
         this.scum,
         this.silt,
         this.pads,
-        { kernel: this.midgeSim, prev: this.midgePrev?.tex ?? null, selected: this.midges.selected, pond: this.pond, frameTime: dt * Math.max(steps, 1), seenStyles: this.seenStyles() },
+        { kernel: this.midgeSim, prev: this.midgePrev?.tex ?? null, selected: this.midges.selected, alive: this.midgeStats?.alive ?? this.midgeSim.count, pond: this.pond, frameTime: dt * Math.max(steps, 1), seenStyles: this.seenStyles() },
         this.params,
         this.fish.selected,
         this.time,
@@ -431,8 +468,8 @@ export class Engine {
   /** How the selected midge's seen items are ringed, per item source (render/focus.js SEEN_STYLES). */
   seenStyles() {
     if (this.seenStyleCache) return this.seenStyleCache
-    const colours = new Float32Array(16)
-    const radii = new Float32Array(4)
+    const colours = new Float32Array(Object.keys(SOURCE).length * 4)
+    const radii = new Float32Array(Object.keys(SOURCE).length)
     for (const [key, src] of Object.entries(SOURCE)) {
       const st = SEEN_STYLES[key]
       colours.set([...st.colour, st.alpha], src * 4)
@@ -459,12 +496,12 @@ export class Engine {
     if (!this.params.showInsects) return
     this.midges.readAll(({ alive, population, state, aux }) => {
       let eating = 0
-      let resting = 0
+      let down = 0
       const cells = new Map()
       for (let i = 0; i < k.count; i++) {
         const mode = aux[i * 4 + 1]
         if (mode === MODE.onFlower) eating++
-        if (mode === MODE.resting) resting++
+        if (mode === MODE.down) down++
         if (mode !== MODE.flying) continue
         const c = Math.floor(state[i * 4] / SWARM_CELL) * 4096 + Math.floor(state[i * 4 + 1] / SWARM_CELL)
         cells.set(c, (cells.get(c) ?? 0) + 1)
@@ -474,16 +511,18 @@ export class Engine {
       const L = this.laying
       const left = alive + L.eggs
       if (!left && this.midgesPresent) this.midgeExtinctions++
+      const training = this.params.midgeTrain && !left
       this.midgesPresent = left > 0
       this.midgeHistory.push([this.time, alive])
       if (this.midgeHistory.length > MIDGE_HISTORY_LENGTH) this.midgeHistory.shift()
       this.midgeStats = {
         alive,
         eating,
-        restingMidges: resting,
+        down,
         swarms,
         eggs: L.eggs,
         laid: L.laid,
+        wasted: L.wasted,
         hatched: L.hatched,
         deaths: { starved: L.deaths[DEATH.starved] ?? 0, old: L.deaths[DEATH.old] ?? 0, rain: L.deaths[DEATH.rain] ?? 0 },
         ...(this.flowerStats ?? { dry: 0, resting: 0, flowers: 0 }),
@@ -493,6 +532,7 @@ export class Engine {
         history: this.midgeHistory.slice(),
         population,
       }
+      if (training) this.nextTrainingSession()
     })
     const N = this.pond.nectar
     if (N) {
@@ -536,7 +576,7 @@ export class Engine {
     this.statsTicks = (this.statsTicks ?? 0) + 1
     if (this.statsTicks % 4 === 0) this.readMidgeStats() // about once a second
     const gpuSimMs = this.params.paused ? 0 : this.simTimer.ms
-    const midgeStats = this.params.showInsects ? (this.midgeStats ?? { alive: this.midgeSim.count, eating: 0, restingMidges: 0, swarms: 0, eggs: 0, laid: 0, hatched: 0, deaths: { starved: 0, old: 0, rain: 0 }, dry: 0, resting: 0, flowers: 0, time: this.time, extinctions: this.midgeExtinctions, extinct: false, history: this.midgeHistory.slice(), population: null }) : null
+    const midgeStats = this.params.showInsects ? (this.midgeStats ?? { alive: this.midgeSim.count, eating: 0, down: 0, swarms: 0, eggs: 0, laid: 0, wasted: 0, hatched: 0, deaths: { starved: 0, old: 0, rain: 0 }, dry: 0, resting: 0, flowers: 0, time: this.time, extinctions: this.midgeExtinctions, extinct: false, history: this.midgeHistory.slice(), population: null }) : null
     this.onStats?.({
       fps,
       gpuSimMs,
@@ -546,7 +586,7 @@ export class Engine {
       wind: { direction: this.wind.direction ?? this.params.windDirection, speed: this.wind.speed },
       rain: this.rain.level,
       raining: this.rain.on,
-      midges: midgeStats && { ...midgeStats, selected: this.midges.selected >= 0 ? this.midges.selectedInfo : null },
+      midges: midgeStats && { ...midgeStats, train: { sessions: this.trainSessions, saves: this.trainSaves }, selected: this.midges.selected >= 0 ? this.midges.selectedInfo : null },
       selected: this.fish.selected >= 0 ? this.fish.selectedInfo : null,
       history: this.history.slice(),
     })

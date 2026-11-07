@@ -10,10 +10,17 @@ const BULK_GENOMES = 32
  * the shader marks a lay in the layer's aux1 (when: x, where: y, z) and
  * lays no other until `ack` (u_eggAck) passes that time. Here, every
  * POLL_EVERY sim s, aux and aux1 are read back; each lay since the last read
- * becomes an egg (def.egg: a boid in the egg mode, hatching after
- * `eggHatchTime` s) with a mutated copy of the layer's genome, in a slot
- * left empty or past the end (the count grows). Then `ack` moves up to the
+ * becomes a clutch (def.clutch: how many eggs, and each one's energy; one
+ * egg without it) of eggs (def.egg: boids in the egg mode, hatching after
+ * `eggHatchTime` s), each with its own mutated copy of the layer's genome,
+ * in slots left empty or past the end (the count grows). Then `ack` moves up to the
  * read's time, so no lay is missed or counted twice.
+ *
+ * A lay marked at x -1 was off its laying ground: no eggs (counted as
+ * wasted).
+ *
+ * Each egg is its layer's generation + 1 (aux.w); `best` keeps one of the
+ * latest generation laid since the last reset.
  *
  * Along the way it counts, between reads: hatched (egg -> alive) and deaths
  * by cause (alive -> not, aux1[causeChannel]); and the eggs waiting.
@@ -38,9 +45,11 @@ export class Laying {
     this.lastRead = -Infinity
     this.prev = null // each slot's mode at the last read
     this.laid = 0
+    this.wasted = 0
     this.hatched = 0
     this.deaths = {}
     this.eggs = 0
+    this.best = null // the egg of the latest generation laid since the reset: { generation, genome }
   }
 
   /** Start a read if one is due (call once a frame, after stepping). */
@@ -82,7 +91,10 @@ export class Laying {
       if (mode === L.egg) eggs++
       if (mode === L.empty) free.push(i)
       const t = aux1[i * 4]
-      if (t > this.readUpTo && t <= time) lays.push({ parent: i, x: aux1[i * 4 + 1], y: aux1[i * 4 + 2], t })
+      if (t > this.readUpTo && t <= time) {
+        if (aux1[i * 4 + 1] < 0) this.wasted++
+        else lays.push({ parent: i, x: aux1[i * 4 + 1], y: aux1[i * 4 + 2], t, generation: Math.floor(aux[i * 4 + 3]), eggs: aux1[i * 4 + 3] })
+      }
     }
     this.prev = Float32Array.from({ length: n }, (_, i) => aux[i * 4 + L.modeChannel])
     this.readUpTo = time
@@ -119,17 +131,24 @@ export class Laying {
     }
   }
 
-  /** Each lay an egg: into the free slots, then past the end. */
+  /** Each lay a clutch of eggs, a little apart: into the free slots, then past the end. */
   place(lays, genomeOf, free, time, params) {
     const k = this.kernel
     const genes = this.def.genes
     const boids = []
     let next = k.count
     for (const lay of lays) {
-      const slot = free.length ? free.shift() : next++
       const parent = genomeOf(lay)
-      const genome = params[this.def.lays.lockParam] ? parent : mutate(genes, parent, params.mutationRate, params.mutationSize, params.mutationFlip)
-      boids.push({ slot, ...this.def.egg(lay.x, lay.y, genome, lay.t + params.eggHatchTime) })
+      const { count, energy } = this.def.clutch?.(parent, lay.eggs) ?? { count: 1 }
+      for (let c = 0; c < count; c++) {
+        const slot = free.length ? free.shift() : next++
+        const genome = params[this.def.lays.lockParam] ? parent : mutate(genes, parent, params)
+        const a = Math.random() * Math.PI * 2
+        const r = count > 1 ? 2 + Math.random() * 3 : 0
+        const generation = (lay.generation ?? 0) + 1
+        if (generation > (this.best?.generation ?? 0)) this.best = { generation, genome }
+        boids.push({ slot, ...this.def.egg(lay.x + Math.cos(a) * r, lay.y + Math.sin(a) * r, genome, lay.t + params.eggHatchTime, energy, generation) })
+      }
     }
     k.place(boids)
     const L = this.def.lays

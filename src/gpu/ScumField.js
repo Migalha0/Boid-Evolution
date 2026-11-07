@@ -78,6 +78,7 @@ export class ScumField {
     }
     this.dims = [w, h]
     this.cur = 0
+    this.still = true
   }
 
   get texture() {
@@ -103,7 +104,12 @@ export class ScumField {
         gl.clear(gl.COLOR_BUFFER_BIT)
       }
       this.mapVersion = mapTex.version
+      this.still = true
     }
+    // Every frond where it grew (no drift anywhere) and no wake to shove one:
+    // a step would leave all at 0, so skip it.
+    if (this.still && sway.zero) return
+    this.still = false
     const next = 1 - this.cur
     const { u } = this.prog
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.fbos[next])

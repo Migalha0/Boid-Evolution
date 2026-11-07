@@ -10,13 +10,14 @@ import { HEADER, ID_BITS, MAX_CELLS } from '../simShaders.js'
  *   pre        species GLSL: RANGE (how far it sees) and its own declarations
  *   flock      its own kind, nearest grid cells first, at most u_maxNeighbors
  *              counted and u_scanBudget looked at; for each candidate
- *              nb = (x, y, vx, vy) the species' `visit` GLSL runs (it bumps
- *              FLOCK_N for one it counts)
+ *              nb = (x, y, vx, vy) (at nbAt in the sorted order) the
+ *              species' `visit` GLSL runs (it bumps FLOCK_N for one it counts)
  *   items      every item sense in one pass over the item grid, nearest
  *              cells first and bounded: per sense <key> P_<key> (a pull
  *              towards its items within RANGE, each weighing 1 - d / RANGE,
  *              times its `weight` (GLSL on `id`, 1 without), at most 1
- *              long), N_<key> (how many), NEAR_<key> (the nearest seen: x,
+ *              long; or, with a `visit`, that GLSL instead, on d, dd and
+ *              id), N_<key> (how many), NEAR_<key> (the nearest seen: x,
  *              y, id, distance); items its `filter` rejects (GLSL on `id`)
  *              or weighs at 0 or less are not seen. A sense reads one item
  *              `source`, or several (`sources`)
@@ -83,7 +84,7 @@ function itemScan(def) {
             float w = N_${s.key} < MAX_ITEMS && (${s.filter ?? 'true'}) ? ${s.weight ?? '1.0'} : 0.0;
             if (w > 0.0) {
               N_${s.key}++;
-              if (dd > 1e-3) P_${s.key} += d * ((1.0 - dd / RANGE) / dd * w);
+              ${s.visit ?? `if (dd > 1e-3) P_${s.key} += d * ((1.0 - dd / RANGE) / dd * w);`}
               if (dd < NEAR_${s.key}.w) NEAR_${s.key} = vec4(it.xy, id, dd);
             }
           }`,
@@ -130,6 +131,7 @@ ${clamp}`
 }
 
 const flockInputs = () => `uniform sampler2D u_sorted;
+uniform usampler2D u_sortedKeys;
 uniform usampler2D u_cellTable;
 uniform vec2 u_cellSize;
 uniform ivec2 u_grid;
@@ -171,7 +173,8 @@ const flockScan = (def) => `
       budget -= scan;
       int k = len > 0 ? self % len : 0;
       for (int j = 0; j < scan && FLOCK_N < u_maxNeighbors; j++) {
-        vec4 nb = texelFetch(u_sorted, coordOf(range.x + k), 0);
+        ivec2 nbAt = coordOf(range.x + k);
+        vec4 nb = texelFetch(u_sorted, nbAt, 0);
         if (++k == len) k = 0;
         vec2 d = nb.xy - pos;
         float d2 = dot(d, d);
@@ -189,7 +192,8 @@ const senseNow = (def) => `${flockScan(def)}${itemSenses(def).length ? `\n${item
  * textures (4 channels each, 4 textures at most):
  *   def.remember  its flock totals ({ name: 'int' | 'float' | 'vec2' },
  *                 variables `pre` declares): a vec2 as two halves in one
- *                 channel, a float exactly, an int in 8 bits (0..255)
+ *                 channel, a vec4 in two, a float exactly, an int in 8 bits
+ *                 (0..255)
  *   items         P_<key> (two halves), NEAR_<key> (its place as fractions
  *                 of the world, and its id + 1, 0 for none) where the
  *                 species' GLSL reads them, and every N_<key> in 4 bits
@@ -207,6 +211,7 @@ export function lookLayout(def) {
   for (const [name, type] of remember) {
     if (type === 'int') ints.push([name, 8])
     else if (type === 'vec2') entries.push({ writes: [`packHalf2x16(${name})`], read: ([c]) => `${name} = unpackHalf2x16(${c});` })
+    else if (type === 'vec4') entries.push({ writes: [`packHalf2x16(${name}.xy)`, `packHalf2x16(${name}.zw)`], read: ([a, b]) => `${name} = vec4(unpackHalf2x16(${a}), unpackHalf2x16(${b}));` })
     else if (type === 'float') entries.push({ writes: [`floatBitsToUint(${name})`], read: ([c]) => `${name} = uintBitsToFloat(${c});` })
     else throw new Error(`${def.name}: cannot remember ${name} (${type})`)
   }
@@ -344,7 +349,6 @@ export function buildUpdateShader(def, debug = false) {
   return `${HEADER}
 uniform sampler2D u_aux;   // previous aux (species-defined)
 uniform sampler2D u_traits; // per-boid constants
-uniform usampler2D u_sortedKeys;
 uniform int u_count;
 uniform vec2 u_world;
 uniform vec2 u_rescale;

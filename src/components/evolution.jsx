@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { FORCES, SEEN_STYLES } from '../render/focus.js'
 import { downloadProfile, loadLibrary, makeIndividualProfile, makeProfile, parseProfile, saveLibrary } from '../sim/profiles.js'
 import { Hint, Section, Toggle } from './controls.jsx'
@@ -87,11 +87,11 @@ export function HowTheyLive({ food, breeding, breedingTitle }) {
  * A selected creature's position and velocity in 3D, as world px and px/s:
  * x right, y down the screen, z up (0 the water surface, negative under it).
  */
-export function Vectors({ position, velocity }) {
+export function Vectors({ position, velocity, className = 'text-[10px]' }) {
   if (!position || !velocity) return null
   const row = (v, digits) => v.map((c) => c.toFixed(digits).padStart(7)).join('')
   return (
-    <pre className="font-mono text-[10px] leading-snug text-amber-200/90" title="x right, y down the screen, z up (0 is the water surface, negative is under it)">
+    <pre className={`font-mono leading-snug text-amber-200/90 ${className}`} title="x right, y down the screen, z up (0 is the water surface, negative is under it)">
       {`${''.padEnd(5)}${['x', 'y', 'z'].map((a) => a.padStart(7)).join('')}\npos  ${row(position, 0)}  px\nvel  ${row(velocity, 1)}  px/s`}
     </pre>
   )
@@ -128,6 +128,12 @@ export function GeneTable({ genes, spread, compare, compareLabel, list }) {
 /** What a profile holds, as a short tag: a population average or one individual's genes. */
 function SourceTag({ profile: p }) {
   const one = p.source === 'individual'
+  if (p.handmade)
+    return (
+      <span className="shrink-0 rounded bg-emerald-400/15 px-1 text-[9px] uppercase tracking-wide text-emerald-300" title="Made by hand in the profile editor (exact genes)">
+        made
+      </span>
+    )
   return (
     <span
       className={`shrink-0 rounded px-1 text-[9px] uppercase tracking-wide ${one ? 'bg-amber-400/15 text-amber-300' : 'bg-sky-400/15 text-sky-300'}`}
@@ -147,8 +153,13 @@ function SourceTag({ profile: p }) {
  * the species' (time, extinctions, selected); `singular`: one of them
  * ("midge").
  */
-export function Profiles({ species, title, params, setParam, stats, actions, profileKey, lockKey, singular, plural, restartLabel }) {
+export function Profiles({ species, title, params, setParam, stats, actions, profileKey, lockKey, singular, plural, restartLabel, editor }) {
   const [library, setLibrary] = useState(() => loadLibrary(species))
+  // Training saves profiles behind its back (Engine nextTrainingSession): read the library again.
+  const trainSaves = stats?.train?.saves ?? 0
+  useEffect(() => {
+    if (trainSaves) setLibrary(loadLibrary(species))
+  }, [trainSaves, species])
   const [name, setName] = useState('')
   const [error, setError] = useState(null)
   const fileRef = useRef(null)
@@ -217,7 +228,8 @@ export function Profiles({ species, title, params, setParam, stats, actions, pro
       </div>
       {error && <p className="text-[10px] text-red-300">{error}</p>}
       {library.length > 0 && (
-        <ul className="max-h-40 space-y-1 overflow-y-auto">
+        // The scroll bar gets its own gutter (and the list a little padding), so it never sits over the delete buttons.
+        <ul className="max-h-40 space-y-1 overflow-y-auto pr-1.5" style={{ scrollbarGutter: 'stable' }}>
           {library.map((p) => (
             <li
               key={p.name}
@@ -234,7 +246,7 @@ export function Profiles({ species, title, params, setParam, stats, actions, pro
               </button>
               <button
                 type="button"
-                className="text-slate-500 hover:text-red-300"
+                className="shrink-0 rounded px-1.5 text-slate-500 hover:bg-red-500/10 hover:text-red-300"
                 title="Delete"
                 onClick={() => {
                   update(library.filter((q) => q.name !== p.name))
@@ -246,6 +258,20 @@ export function Profiles({ species, title, params, setParam, stats, actions, pro
             </li>
           ))}
         </ul>
+      )}
+      {library.length > 0 && (
+        <button
+          type="button"
+          className={`${dangerButton} w-full`}
+          onClick={() => {
+            if (!window.confirm(`Delete all ${library.length} ${species} profile${library.length === 1 ? '' : 's'}? This cannot be undone (export any you want to keep first).`)) return
+            update([])
+            choose(null)
+          }}
+          title={`Delete every saved ${species} profile`}
+        >
+          Clear all {species} profiles ({library.length})
+        </button>
       )}
       {chosen && (
         <>
@@ -260,8 +286,27 @@ export function Profiles({ species, title, params, setParam, stats, actions, pro
           <Toggle label={`Lock to “${chosen.name}”`} checked={params[lockKey]} onChange={(v) => setParam(lockKey, v)} />
         </>
       )}
+      {editor && (
+        <details className="group rounded-md bg-slate-800/30 p-1.5">
+          <summary className="cursor-pointer list-none text-[11px] text-slate-300">
+            <span className="inline-block w-3 transition-transform group-open:rotate-90">›</span>
+            Make or edit a profile by hand
+          </summary>
+          <div className="pt-2">
+            {editor({
+              chosen,
+              makeProfile: (n, genes) => ({ ...makeIndividualProfile(species, n, { id: 'hand-made', generation: 0, genes }, params, 0), handmade: true }),
+              save: (profile, spawn) => {
+                setError(null)
+                add(profile)
+                if (spawn) actions.restart(profile)
+              },
+            })}
+          </div>
+        </details>
+      )}
       <Hint>
-        <b className="font-medium text-sky-300">avg</b>: the average genes of all the living {plural} (what <code>npm run train</code> saves too). <b className="font-medium text-amber-300">one</b>: the exact genes of the {singular} you selected (click one on the pond). Only {species} profiles are accepted on import. Choose one to give it to the {plural} or start over from it; locked, every one carries it exactly and nothing mutates.
+        <b className="font-medium text-emerald-300">made</b>: made by hand (below). <b className="font-medium text-sky-300">avg</b>: the average genes of all the living {plural} (what <code>npm run train</code> saves too). <b className="font-medium text-amber-300">one</b>: the exact genes of the {singular} you selected (click one on the pond). Only {species} profiles are accepted on import. Choose one to give it to the {plural} or start over from it; locked, every one carries it exactly and nothing mutates.
       </Hint>
     </Section>
   )
@@ -291,7 +336,7 @@ export function ForceLegend({ senses, list }) {
           )
         })}
       </div>
-      {FORCES.filter((f) => senses.forces?.[f.key] != null).map((f) => (
+      {FORCES.filter((f) => senses.forces?.[f.key] != null && (senses.forces[f.key] >= 0.5 || f.key === 'total')).map((f) => (
         <div key={f.key} className="flex items-center gap-1.5">
           <span className="inline-block h-0.5 w-3" style={{ background: f.hex }} />
           <span className="flex-1">{f.label}</span>

@@ -3,10 +3,12 @@ import { SCUM_CELL } from '../gpu/ScumField.js'
 import { PAD_STRIDE } from '../sim/LilyPads.js'
 import { LAND_LEVEL } from '../sim/PondMap.js'
 import { MAX_KINDS, PLANT_KINDS, PLANT_STRIDE, plantSlots } from '../sim/Vegetation.js'
+import { evalCurve } from '../sim/curve.js'
 import { cloudTune } from '../sim/Rain.js'
 import { windPattern, windVector } from '../sim/Wind.js'
 import { createCloudTexture } from './clouds.js'
 import * as S from './shaders.js'
+import { FULL_VISION_Z, GROUND_VISION, VISION_GENE } from '../species/midges.js'
 
 const VEL_LOW = [0.7, 0.8, 0.82]
 const VEL_HIGH = [0.95, 0.6, 0.3]
@@ -23,14 +25,14 @@ const rangeAlpha = (n) => RANGE_ALPHA * Math.min(1, Math.max(0.02, 400 / Math.ma
 const PAD_HEIGHT = 0.275
 
 /**
- * Params -> the shaders' `Tunables` uniform block (TUNE in shaders.js): eight
- * vec4s, in slot order (the last one padded). Each entry turns panel units into the shader's.
+ * Params -> the shaders' `Tunables` uniform block (TUNE in shaders.js): vec4s,
+ * in slot order (the last one padded). Each entry turns panel units into the
+ * shader's. After them, from slot MURK_SLOT, the murk curve at MURK_SAMPLES
+ * even depths.
  */
 const TUNABLES = [
   (p) => 1 - p.shadowDarkness, // SHADOW
   (p) => 1 - p.plantSelfShadow, // PLANT_SELF_SHADE
-  (p) => p.murkSurface,
-  (p) => p.murkDeep,
   (p, r) => r.clouds[0], // CLOUD_SCALE
   (p, r) => r.clouds[1], // CLOUD_COVER threshold (thicker in the rain: sim/Rain.js cloudTune)
   (p, r) => r.clouds[2], // CLOUD_EDGE
@@ -51,17 +53,24 @@ const TUNABLES = [
   (p) => p.plantBend,
   (p) => (p.dithering ? 1 : 0),
   (p) => p.swimWiggle,
-  (p) => p.logMurk,
   (p) => p.deepFade,
   (p) => p.siltOpacity,
   (p) => (p.showPlants ? p.sludgeAmount : 0), // SLUDGE
-  (p) => p.depthEffect, // DEPTH_EFFECT
 ]
+const MURK_SLOT = 28
+const MURK_SAMPLES = 12
 const TUNE_BINDING = 0
 
 // Texture units: sim state/aux are bound once per frame and shared by all programs.
 const UNIT_STATE = 0
 const UNIT_AUX = 1
+/**
+ * Midges flying or falling below this height (px) are drawn among the plants
+ * (under overhanging leaves, like one resting on the water) rather than over
+ * them: a hatchling (at 1 px) or one dropping dead (from 2 px) beside the
+ * water no longer pops into view over the plants and out again.
+ */
+const MIDGE_LOW_FLIGHT = 3
 const UNIT_VERT = 2 // the boid's vert (z, vz): fish depth, midge height; bound per draw (each species its own)
 const UNIT_TRAITS = 3
 const UNIT_ELEV = 4
@@ -164,6 +173,8 @@ export class BoidRenderer {
     this.logProg = createProgram(gl, S.logVS, S.logFS)
     this.siltProg = createProgram(gl, S.fieldVS, S.siltFS)
     this.postProg = createProgram(gl, S.fieldVS, S.postFS)
+    this.leaderProg = createProgram(gl, S.leaderVS, S.leaderFS)
+    this.inspectorRect = null // the inspector panel (css px of the canvas), for the leader line
     this.programs = [
       this.boidProg,
       this.vectorProg,
@@ -188,7 +199,7 @@ export class BoidRenderer {
       this.postProg,
     ]
     // One uniform buffer of look parameters, shared by every program using it.
-    this.tuneData = new Float32Array(Math.ceil(TUNABLES.length / 4) * 4)
+    this.tuneData = new Float32Array(MURK_SLOT + MURK_SAMPLES)
     this.tuneBuf = gl.createBuffer()
     gl.bindBuffer(gl.UNIFORM_BUFFER, this.tuneBuf)
     gl.bufferData(gl.UNIFORM_BUFFER, this.tuneData.byteLength, gl.DYNAMIC_DRAW)
@@ -349,6 +360,7 @@ export class BoidRenderer {
     }
     gl.useProgram(this.visionProg.program)
     gl.uniform1i(this.visionProg.u.u_rangeTex, UNIT_M_RANGE)
+    gl.uniform1i(this.visionProg.u.u_ringVert, UNIT_VERT)
   }
 
   /** @param viewOffset world position of the screen's top-left corner */
@@ -424,6 +436,10 @@ export class BoidRenderer {
    *   items and nectar), or null
    */
   render(sim, mapTex, vegetation, sway, scum, silt, pads, midges, params, selected, time, overlays = []) {
+    // The midges' wing flutter runs on real time (its pace the same at any sim speed), but stops while paused.
+    const now = performance.now() / 1000
+    if (!params.paused) this.flutterClock = ((this.flutterClock ?? 0) + Math.min(0.1, now - (this.flutterLast ?? now))) % 3600
+    this.flutterLast = now
     const gl = this.gl
     const n = sim.count
     const px = params.pixelSize
@@ -441,12 +457,13 @@ export class BoidRenderer {
     this.elevCell = mapTex.elevCell
     this.elevDims = mapTex.elevDims
     // The floor's sludge is sized and murked by the panel: re-render the cached background when those change.
-    this.floorKey = `${params.murkSurface}|${params.murkDeep}|${params.showPlants ? params.sludgeAmount : 0}|${params.floorLitter}|${params.floorStones}|${params.floorTwigs}|${params.sunAzimuth}|${params.sunElevation}|${params.waterTint}|${params.depthEffect}`
+    this.floorKey = `${params.murkCurve}|${params.showPlants ? params.sludgeAmount : 0}|${params.floorLitter}|${params.floorStones}|${params.floorTwigs}|${params.sunAzimuth}|${params.sunElevation}|${params.waterTint}`
     this.floorDetails = [params.floorLitter, params.floorStones, params.floorTwigs]
     this.waterTint = params.waterTint
     this.rain = this.liveRain?.level ?? 0
     this.clouds = cloudTune(params, this.rain)
     TUNABLES.forEach((f, i) => (this.tuneData[i] = f(params, this)))
+    for (let i = 0; i < MURK_SAMPLES; i++) this.tuneData[MURK_SLOT + i] = evalCurve(params.murkCurve, i / (MURK_SAMPLES - 1))
     gl.bindBuffer(gl.UNIFORM_BUFFER, this.tuneBuf)
     gl.bufferSubData(gl.UNIFORM_BUFFER, 0, this.tuneData)
     gl.bindBufferBase(gl.UNIFORM_BUFFER, TUNE_BINDING, this.tuneBuf)
@@ -593,6 +610,10 @@ export class BoidRenderer {
     }
 
     this.present(params)
+    if (this.inspectorRect) {
+      if (midges?.kernel && midges.selected >= 0 && midges.selected < midges.kernel.count) this.drawLeader(midges.kernel, midges.selected)
+      else if (hasSel) this.drawLeader(sim, selected)
+    }
     gl.bindVertexArray(null)
   }
 
@@ -613,6 +634,25 @@ export class BoidRenderer {
     // Caustics drift downwind as fast as they used to slide (about causticSpeed tiles per s).
     this.causticShift[0] += this.wind[0] * causticSpeed * dt
     this.causticShift[1] += this.wind[1] * causticSpeed * dt
+  }
+
+  /** A one-pixel line from boid `i` of a GPU species to the inspector panel (leaderVS), over the finished frame. */
+  drawLeader(kernel, i) {
+    const gl = this.gl
+    const { program, u } = this.leaderProg
+    const r = this.inspectorRect
+    gl.useProgram(program)
+    gl.activeTexture(gl.TEXTURE0 + UNIT_SCENE) // free once the frame is presented
+    gl.bindTexture(gl.TEXTURE_2D, kernel.stateTexture)
+    gl.uniform1i(u.u_state, UNIT_SCENE)
+    gl.uniform2i(u.u_texel, i & (kernel.texW - 1), i >> kernel.texShift)
+    gl.uniform2f(u.u_view, this.width, this.height)
+    gl.uniform2fv(u.u_viewOffset, this.viewOffset)
+    gl.uniform4f(u.u_rect, r.left, r.top, r.right, r.bottom)
+    gl.uniform4f(u.u_colour, 0.98 * 0.8, 0.75 * 0.8, 0.25 * 0.8, 0.8) // amber, as the panel's border (premultiplied)
+    gl.enable(gl.BLEND)
+    gl.bindVertexArray(this.vao)
+    gl.drawArrays(gl.LINES, 0, 2)
   }
 
   /** Cloud-shade, dither and vignette the scene into the (scene-sized) canvas. */
@@ -699,7 +739,7 @@ export class BoidRenderer {
     bind(UNIT_M_AUX, k.auxTexture)
     bind(UNIT_M_TRAITS, k.traitsTexture)
     bind(UNIT_M_PREV, m.prev ?? k.stateTexture)
-    bind(UNIT_M_RANGE, k.genesTexture) // vision is gene 0 (species/midges.js), the first of each midge's geneTexels
+    bind(UNIT_M_RANGE, k.genesTexture) // its vision gene (VISION_GENE), read where it lies in each midge's geneTexels
     bind(UNIT_M_ITEMS, m.pond.items.items)
     bind(UNIT_M_NECTAR, m.pond.nectarTexture)
     bind(UNIT_FLOWER_LOOK, m.pond.flowerLook)
@@ -715,6 +755,7 @@ export class BoidRenderer {
     gl.uniform1i(u.u_mCount, m.kernel.count)
     gl.uniform1i(u.u_mSelected, m.selected)
     gl.uniform1i(u.u_rangeStride, m.kernel.geneTexels)
+    gl.uniform1i(u.u_rangeGene, VISION_GENE)
     gl.uniform2f(u.u_view, this.width, this.height)
     gl.uniform2fv(u.u_viewOffset, this.viewOffset)
     gl.uniform2fv(u.u_cell, this.cell)
@@ -732,6 +773,8 @@ export class BoidRenderer {
     gl.uniform1f(u.u_elevCell, this.elevCell)
     gl.uniform2fv(u.u_elevDims, this.elevDims)
     gl.uniform1f(u.u_time, time)
+    gl.uniform1f(u.u_lowFlight, MIDGE_LOW_FLIGHT)
+    gl.uniform1f(u.u_flutterTime, this.flutterClock ?? 0) // real time, frozen while paused (render)
     if (params) gl.uniform1f(u.u_bodyTime, params.insectBodyTime)
     gl.bindVertexArray(this.vao)
     gl.drawArrays(gl.POINTS, 0, m.kernel.count)
@@ -765,11 +808,14 @@ export class BoidRenderer {
     bind(UNIT_AUX, k.auxTexture)
     bind(UNIT_TRAITS, k.traitsTexture)
     bind(UNIT_M_RANGE, k.genesTexture)
+    bind(UNIT_VERT, k.vertTexture) // each midge's height: its ring shrinks near the water
     const ring = (offset, count, color, alpha) => {
       const u = this.use(this.visionProg, k, offset)
       gl.uniform1i(u.u_rangeFromTex, 1)
       gl.uniform1i(u.u_rangeStride, k.geneTexels)
+      gl.uniform1i(u.u_rangeGene, VISION_GENE)
       gl.uniform1i(u.u_aliveCheck, 1)
+      gl.uniform2f(u.u_heightVision, GROUND_VISION, FULL_VISION_Z) // the lower, the less it sees (species/midges.js)
       gl.uniform1f(u.u_radius, 0)
       gl.uniform1f(u.u_cosHalfFov, -2)
       gl.uniform1f(u.u_sepRatio, 0)
@@ -781,7 +827,9 @@ export class BoidRenderer {
       gl.uniform1f(u.u_halfSpan, Math.PI)
       gl.drawArraysInstanced(gl.TRIANGLES, 0, 6 * S.RING_SEGMENTS, count)
     }
-    if (params.midgeVisionMode === 'all') ring(0, k.count, VISION, rangeAlpha(k.count))
+    // Faded by how many are alive, not by the slots (eggs and the dead's
+    // empty slots, which only grow): only the living get a ring.
+    if (params.midgeVisionMode === 'all') ring(0, k.count, VISION, rangeAlpha(m.alive))
     if (m.selected >= 0) ring(m.selected, 1, VISION_SELECTED, RANGE_SELECTED_ALPHA)
     // The fish's textures back on their units.
     bind(UNIT_STATE, sim.stateTexture)
@@ -861,6 +909,7 @@ export class BoidRenderer {
     gl.uniform1f(u.u_elevCell, mapTex.elevCell)
     gl.uniform2fv(u.u_elevDims, mapTex.elevDims)
     gl.uniform1i(u.u_logCount, mapTex.logCount)
+    gl.uniform2fv(u.u_seedOffset, mapTex.seedOffset)
     gl.uniform1i(u.u_pass, pass)
     const [lx, ly] = this.light
     const l = Math.hypot(lx, ly, 1)

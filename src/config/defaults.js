@@ -1,3 +1,14 @@
+import { GROWTH_DEFAULT } from '../sim/PondMap.js'
+
+/** The murk curve as it starts: [depth 0 surface .. 1 deepest floor, murk 0 clear .. 1 lost] points. */
+export const MURK_DEFAULT = [
+  [0, 0.27],
+  [0.25, 0.5],
+  [0.5, 0.7],
+  [0.75, 0.86],
+  [1, 0.97],
+]
+
 export const DEFAULT_PARAMS = {
   count: 0, // fish (0: midges only)
   paused: false,
@@ -55,9 +66,7 @@ export const DEFAULT_PARAMS = {
 
   // Water
   showWaterMotion: true, // deep-water swirl, shallow caustics and ripples
-  murkSurface: 0.18, // how much a fish right below the surface fades into the water
-  murkDeep: 0.88, // ... and one on the deepest bottom
-  depthEffect: 1.6, // how strongly depth shows: 1 = as the murk says; higher, everything fades and darkens sooner with depth
+  murkCurve: MURK_DEFAULT, // how far things fade into the water by depth (render/shaders.js murkAt); the water's colour darkens along it too
   swirlStrength: 0.07, // brightness change of the deep-water silt swirl
   swirlSize: 900, // world px per swirl noise tile
   swirlSpeed: 0.004, // noise tiles per second the eddies turn over
@@ -82,12 +91,11 @@ export const DEFAULT_PARAMS = {
   plantBreeze: 1, // how far plants lean in the wind
   plantBend: 1.4, // how far fish push plants aside
   logCount: 4, // fallen tree trunks, from the banks into the water
+  plantGrowth: GROWTH_DEFAULT, // how much grows where, inland .. shore .. deep water ([x, growth] points; sim/PondMap.js)
   logLandClearing: 0.3, // 0 = land plants ignore trunks .. 1 = bent fully clear of them
-  logMurk: 2.5, // how quickly submerged trunks fade into the murk with depth
   waterTint: 0, // water colour in the middle and deep: 0 = peaty blue-green, 1 = muddy brown
   waterDepth: 1, // how deep the water is, as a multiple of the generated depth (the shore stays put)
   landAmount: 1, // how much of the map is land: 0 = open water to the banks, 1 = as generated, 2 = mostly land
-  plantDeepSparseness: 0.6, // 0 = even growth .. 1 = no plants at the deep edge of the plant zone
   sludgeAmount: 0.5, // how much of the shallow-mid floor is covered in sludge
   // Floor details (0 = none; drawn into the cached floor, so free per frame)
   floorLitter: 0.5, // fallen leaves, thickest near the banks
@@ -100,30 +108,39 @@ export const DEFAULT_PARAMS = {
   midgeVisionMode: 'selected', // midges' vision rings: 'all' | 'selected' | 'off'
   midgeLookEvery: 4, // midge tick rate: steps between looks at midges, flowers, scum and pads (taking turns)
   insectWind: 1, // how far the wind carries them
-  insectHunger: 0.03, // energy a midge burns per second flying at 70 px/s (full = 1)
+  midgeEnergyMax: 3, // energy (e) a full midge holds; its hunger and laying genes are shares of it
+  midgeFeedRate: 0.6, // energy (e) per second a midge drinks on a flower (the flower loses as much nectar)
+  midgeBaseBurn: 0.008, // energy (e) a midge's body burns per second just being awake, down or flying alike
+  insectHunger: 0.008, // energy flight adds per second at 70 px/s (with speed squared; none perched or resting)
+  linkCost: 0.001, // energy per second the first link of a midge's wiring costs, whatever it is doing
+  linkGrowth: 0.02, // each further link costs this much more than the one before (compounding; 0 = all alike)
   insectBodyTime: 12, // seconds a dead midge's body lies before it is gone
-  midgeLifespan: 120, // seconds from hatching before a midge ages
-  midgeAgeSlow: 0.97, // past its lifespan, a midge's speeds x this every second
-  midgeAgeBurn: 1.03, // past its lifespan, a midge's energy burn x this every second
-  eggHatchTime: 15, // seconds a midge egg on the scum takes to hatch
+  midgeLifespan: 300, // seconds from hatching before a midge ages
+  midgeAgeing: 0.03, // past its lifespan, every second a midge's energy burn x (1 + this) and its speeds ÷ it
+  eggCost: 0.05, // energy (e) each egg costs its layer, on top of the clutch's energy (which goes to the hatchlings)
+  eggHatchTime: 10, // seconds a midge egg on the scum takes to hatch
   flowerNectar: 1, // meals (full energy) a flower holds
-  flowerRegrow: 50, // seconds a drunk-dry flower takes to refill
+  flowerRegrow: 25, // seconds a drunk-dry flower takes to refill
   flowerRefills: 6, // refills before a flower wilts and rests (0 = never), varied per flower
   flowerDormancy: 100, // seconds a wilted flower rests before refilling, varied per flower
-  mutationRate: 0.1, // chance each gene mutates in a hatchling
-  mutationSize: 0.08, // typical mutation, as a fraction of the gene's range
+  mutationCount: 2, // background mean of how many genes mutate in a hatchling (a Poisson count; plus its own mutCount gene)
+  mutationSize: 0.05, // background mutation size σ (plus its own mutSigma gene)
+  mutationRelative: 0.75, // share of a mutation that scales the gene (the rest adds σ x its range)
   mutationFlip: 0.05, // chance a mutation flips the gene's sign instead
+  wireStart: 0.3, // a fresh random flock: chance each link of the wiring is there (species/midges.js)
+  gateStart: 0.3, // a fresh random flock: chance each link has a gate (a random one, on a random input; species/midges.js GATES)
+  wireRate: 0.005, // chance each link is made or broken in a hatchling (or when spawning from a profile)
   midgeProfile: null, // the chosen profile ({ name, genes, ... }), if any
   midgeLocked: false, // every midge carries the profile's genome exactly, no mutations
+  midgeTrain: false, // training: whenever every midge (and egg) is gone, midgeTrainCount more are spawned
+  midgeTrainCount: 100, // midges spawned per training session
+  midgeTrainFrom: 'random', // training flocks: 'random' genomes, or 'best' (mutated copies of the best training profile saved)
   // How much of each plant kind grows (1 = as generated, 0 = none)
-  plantRush: 1,
   plantReed: 1,
   plantCattail: 1,
   plantIris: 1, // yellow flowers (midge food)
-  plantShrub: 1,
   plantPickerelweed: 1, // purple flowers (midge food)
   flowerVariation: 1.5, // how far each plant's flower (and cattail spike) strays from its kind's colour (0 = all alike)
-  plantShallowDensity: 0.5, // share of the shallowest water and shore fringe that is planted (rest: open gaps)
   wakeRadius: 16, // px of water a swimming fish disturbs
   wakeStrength: 10, // how hard fish push the water
   wakeFade: 3, // rate (1/s) the disturbance settles
@@ -140,7 +157,7 @@ export const DEFAULT_PARAMS = {
   fishLookEvery: 1, // fish tick rate: steps between looks at the shoal (taking turns)
   showVelocity: false,
   showSteering: false,
-  showPlants: true, // reeds, cattails, iris, shrubs and lily pads (display only)
+  showPlants: true, // reeds, cattails, flowers, scum and lily pads (display only)
   velocityScale: 0.22, // px of arrow per px/s
   steeringScale: 0.08, // px of arrow per px/s²
   colorLevels: 24, // colour levels per channel (lo-fi palette depth)
